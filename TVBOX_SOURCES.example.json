@@ -1,0 +1,8 @@
+# 复制本文件内容到 EdgeOne 环境变量 TVBOX_SOURCES
+# 说明：id 是给 TVBox 用的标识，name 是显示名，path 必须是 OpenList 管理后台里的真实绝对路径
+# password 可选，仅当目录被 OpenList 密码保护时填写
+[
+  { "id": "movie", "name": "电影", "path": "/阿里云盘/电影" },
+  { "id": "series", "name": "剧集", "path": "/阿里云盘/电视剧" },
+  { "id": "anime", "name": "动画", "path": "/夸克/动画" }
+]
