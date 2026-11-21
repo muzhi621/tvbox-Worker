@@ -1,31 +1,40 @@
 // EdgeOne Makers 边缘中间件：SPA 路由回退
 //
 // cloud-functions/[[default]].js（构建产物，见 scripts/build-edge.mjs）是根级
-// catch-all，会接管所有未命中静态文件的
-// 请求（包括 /add、/@manage/* 等前端路由），而 Node 函数内没有 ASSETS 绑定，
-// Hono 兜底只能返回 404 —— 这就是「访问 /add 404 后整站打不开」的原因。
-// 此中间件在边缘层先行拦截：浏览器导航请求（Accept: text/html）且不属于
-// 后端路径时，透明改写为 /index.html，由静态 CDN 直接返回页面壳；
-// /api、/d、/p、/sd、/health 等后端路径照常放行到云函数。
+// catch-all，会接管所有未命中静态文件的请求。Node 函数内没有 ASSETS 绑定，
+// 需在边缘层区分「后端请求」与「前端页面导航」：
+//   后端请求       → 放行到云函数（Hono 路由处理）
+//   前端页面导航   → rewrite 到 /index.html，由静态 CDN 返回页面壳
 //
-// 注意：EdgeOne 的 middleware 属于轻量中间件，context 仅提供
-// request / next / redirect / rewrite / geo / clientIp，**没有 env**，
-// 因此无法访问 KV 或环境变量。KV 代理请使用 functions/ 目录下的
-// Edge Functions（见 functions/kv-get 等），那里才具备 KV 能力。
-// EdgeOne 约定 middleware.js 需显式导出 config 声明匹配范围；缺失时 CLI
-// 报「Could not find config in middleware file, using defaults」并回退
-// 默认 matcher。这里显式声明与默认值一致的 /:path*，消除警告并锁定行为。
+// 后端路径必须完整列出。若遗漏（例如新增的 /@omnibox、/@tvbox），浏览器导航
+// 会被错误 rewrite 到 /index.html，导致管理端点显示成 SPA 壳而非云函数响应。
+
+// EdgeOne 约定 middleware.js 需显式导出 config 声明匹配范围。
 export const config = {
   matcher: [{ source: "/:path*" }],
 }
+
+// 后端路径：这些必须直达云函数，绝不能被 rewrite 到 /index.html。
+//  /api         OpenList / OmniBox 的 JSON API
+//  /@tvbox      TVBox 订阅端点（config.json / api / spider / manage）
+//  /@omnibox    OmniBox 管理端点（status / media / sources / subscribe ...）
+//  /d /p /sd    播放直链
+//  /kv-*        EdgeOne KV 代理
+//  /health      健康检查
+//  /@init       OpenList 初始化状态探测
+//
+// 注意：/@omnibox 与 /@tvbox 既是 API 又是页面入口。它们的 HTML 导航放行到
+// 云函数后，由云函数 SPA 兜底返回构建期内联的 dist/index.html（OmniBox 单页），
+// 比 rewrite 到静态 /index.html 更可靠（不受静态缓存影响）。
+const BACKEND_RE =
+  /^\/(api|@omnibox|@tvbox|@init|d|p|sd|kv-get|kv-put|kv-delete|kv-list|health)(\/|$|\?)/
 
 export function middleware(context) {
   const { request, next, rewrite } = context
   const { pathname } = new URL(request.url)
   const accept = request.headers.get("accept") || ""
 
-  const isBackend =
-    pathname === "/health" || /^\/(api|d|p|sd|kv-get|kv-put|kv-delete|kv-list)(\/|$)/.test(pathname)
+  const isBackend = BACKEND_RE.test(pathname)
 
   if (
     !isBackend &&
