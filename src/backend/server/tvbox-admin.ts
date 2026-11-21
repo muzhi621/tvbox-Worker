@@ -8,6 +8,7 @@ import {
   saveSources,
   type TvboxSource,
 } from "./tvbox-store"
+import { requestUrl } from "./request-origin"
 
 /**
  * TVBox 源管理页与配套 API。
@@ -22,14 +23,13 @@ import {
 export const tvboxAdminRouter = new Hono()
 
 tvboxAdminRouter.use("*", async (c, next) => {
-  const denied = accessDenied(c, true)
+  const denied = await accessDenied(c, true)
   if (denied) return denied
   await next()
 })
 
 function absoluteUrl(c: any, path: string): string {
-  const origin = new URL(c.req.url).origin
-  return `${origin}${path.startsWith("/") ? path : `/${path}`}`
+  return requestUrl(c, path)
 }
 
 type MountOption = {

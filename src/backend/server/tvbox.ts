@@ -24,6 +24,7 @@ import {
   type TvboxSource,
 } from "./tvbox-store"
 import { runSpider } from "./spider-runner"
+import { requestUrl } from "./request-origin"
 
 /**
  * TVBox / CatVod 兼容端点。
@@ -41,6 +42,17 @@ import { runSpider } from "./spider-runner"
  */
 
 export const tvboxRouter = new Hono()
+
+// TVBox / 影视 App 常用 WebView 直连订阅地址，必须允许跨域读取，
+// 否则浏览器直连会被 CORS 拦截（表现为“无法解析配置”）。
+tvboxRouter.use("*", async (c, next) => {
+  c.header("Access-Control-Allow-Origin", "*")
+  c.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+  c.header("Access-Control-Allow-Headers", "Content-Type, X-TVBox-Code")
+  c.header("Access-Control-Max-Age", "86400")
+  if (c.req.method === "OPTIONS") return c.body(null, 204)
+  await next()
+})
 
 const VIDEO_EXT = new Set([
   "mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "ts", "rmvb", "rm",
@@ -165,8 +177,7 @@ function pageOf(c: any): number {
 }
 
 function absoluteUrl(c: any, path: string): string {
-  const origin = new URL(c.req.url).origin
-  return `${origin}${path.startsWith("/") ? path : `/${path}`}`
+  return requestUrl(c, path)
 }
 
 async function toVod(

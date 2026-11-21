@@ -26,6 +26,7 @@ import {
   type TvboxSource,
   type SpiderSource,
 } from "./omnibox-store"
+import { requestUrl } from "./request-origin"
 
 /**
  * OmniBox 风格统一入口。
@@ -46,9 +47,9 @@ omniboxRouter.use("*", async (c, next) => {
 registerSpiderLibraryRoutes(omniboxRouter)
 registerOmniBoxDataRoutes(omniboxRouter)
 
-function absoluteUrl(c: any, path: string): string {
-  const origin = new URL(c.req.url).origin
-  return `${origin}${path.startsWith("/") ? path : `/${path}`}`
+function absoluteUrl(c: any, path: string, explicitBaseUrl = ""): string {
+  // 优先使用前端传入的当前站点域名，避免 EdgeOne 内部域名泄漏到订阅链接
+  return requestUrl(c, path, explicitBaseUrl)
 }
 
 // ---------- 概览 ----------
@@ -457,7 +458,7 @@ omniboxRouter.post("/subscribe", async (c) => {
   else if (code) params.push(`code=${encodeURIComponent(code)}`)
   params.push(`sel=${encodeURIComponent(payload)}`)
   params.push(`sig=${encodeURIComponent(sig)}`)
-  const url = `${absoluteUrl(c, "/@tvbox/config.json")}?${params.join("&")}`
+  const url = `${absoluteUrl(c, "/@tvbox/config.json", String(body.baseUrl || ""))}?${params.join("&")}`
   return c.json({
     code: 200,
     data: { url, netdisk: validNetdisk.length, spiders: validSpiders.length },
