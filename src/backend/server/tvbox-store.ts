@@ -60,6 +60,32 @@ export async function isSubscriptionToken(c: any, token: string): Promise<boolea
 }
 
 /**
+ * 读取指定订阅（服务端短链接使用）。
+ * token 非空时同时校验令牌归属，避免用 A 的 token 读取 B 的订阅；
+ * token 为空表示调用方已通过主访问码鉴权，跳过令牌校验。
+ */
+export async function readSubscription(
+  c: any,
+  id: string,
+  token = "",
+): Promise<any | null> {
+  if (!id) return null
+  try {
+    const db = await getDb(c.env)
+    const row = (db.settings || []).find((s: any) => s && s.key === "omnibox_subscriptions")
+    if (!row || typeof row.value !== "string") return null
+    const list = JSON.parse(row.value)
+    if (!Array.isArray(list)) return null
+    const sub = list.find((s: any) => s && constantTimeEqual(String(s.id || ""), String(id)))
+    if (!sub || sub.enabled === false) return null
+    if (token && !constantTimeEqual(String(sub.token || ""), String(token))) return null
+    return sub
+  } catch {
+    return null
+  }
+}
+
+/**
  * 访问码校验。requireCode=true 时（管理 API）若未配置访问码直接拒绝，
  * 避免管理端点在未设置访问码的部署上完全暴露。
  * 非管理端点额外接受订阅令牌，便于每条订阅使用独立链接。

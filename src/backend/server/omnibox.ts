@@ -16,7 +16,7 @@ import { scanMedia, getScanProgress, isScanRunning } from "../internal/media/sca
 import { readMounts } from "./tvbox-admin"
 import { runSpider } from "./spider-runner"
 import { registerSpiderLibraryRoutes } from "./spider-library"
-import { registerOmniBoxDataRoutes } from "./omnibox-extra"
+import { registerOmniBoxDataRoutes, readAppSection } from "./omnibox-extra"
 import {
   accessDenied,
   envValue,
@@ -443,6 +443,36 @@ omniboxRouter.post("/spider/call", async (c) => {
 
 omniboxRouter.post("/subscribe", async (c) => {
   const body = await c.req.json().catch(() => ({}))
+  const baseUrl = String(body.baseUrl || "")
+  const subId = String(body.subId || "").trim()
+
+  // 短链接模式（推荐）：订阅已持久化在服务端，链接只带订阅 id + token。
+  // 与内网 OmniBox 2.1 的 /api/subscription/{id}/tvbox2?token=... 一致。
+  if (subId) {
+    const subs: any[] = await readAppSection(c, "subscriptions")
+    const sub = subs.find((s: any) => s && String(s.id) === subId)
+    if (!sub) return c.json({ code: 404, message: "订阅不存在，请先保存" }, 404)
+    const token = String(body.token || sub.token || "").trim()
+    const params: string[] = []
+    if (token) params.push(`token=${encodeURIComponent(token)}`)
+    else {
+      const code = envValue(c, "TVBOX_ACCESS_CODE")
+      if (code) params.push(`code=${encodeURIComponent(code)}`)
+    }
+    const subPath = `/@tvbox/sub/${encodeURIComponent(subId)}`
+    const url = requestUrl(c, subPath, baseUrl) + (params.length ? `?${params.join("&")}` : "")
+    return c.json({
+      code: 200,
+      data: {
+        url,
+        short: true,
+        netdisk: Array.isArray(sub.netdisk) ? sub.netdisk.length : 0,
+        spiders: Array.isArray(sub.spiders) ? sub.spiders.length : 0,
+      },
+    })
+  }
+
+  // 兼容旧调用：直接在 URL 里编码选中的源（sel + sig）
   const netdisk: string[] = Array.isArray(body.netdisk) ? body.netdisk.map(String) : []
   const spiders: string[] = Array.isArray(body.spiders) ? body.spiders.map(String) : []
   const cfg = await readConfig(c)
@@ -458,7 +488,7 @@ omniboxRouter.post("/subscribe", async (c) => {
   else if (code) params.push(`code=${encodeURIComponent(code)}`)
   params.push(`sel=${encodeURIComponent(payload)}`)
   params.push(`sig=${encodeURIComponent(sig)}`)
-  const url = `${absoluteUrl(c, "/@tvbox/config.json", String(body.baseUrl || ""))}?${params.join("&")}`
+  const url = `${absoluteUrl(c, "/@tvbox/config.json", baseUrl)}?${params.join("&")}`
   return c.json({
     code: 200,
     data: { url, netdisk: validNetdisk.length, spiders: validSpiders.length },

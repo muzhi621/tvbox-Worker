@@ -21,6 +21,7 @@ import {
   hmac,
   readSources,
   readConfig,
+  readSubscription,
   type TvboxSource,
 } from "./tvbox-store"
 import { runSpider } from "./spider-runner"
@@ -311,31 +312,16 @@ async function detail(
   }
 }
 
-tvboxRouter.get("/config.json", async (c) => {
-  const denied = await accessDenied(c)
-  if (denied) return denied
+/**
+ * 根据选中的网盘/爬虫源构造 TVBox config.json。
+ * 供长链接（sel 参数）与短链接（服务端订阅）两条路径共用，保证行为一致。
+ */
+async function buildConfigFromSelection(
+  c: any,
+  netdiskIds: string[],
+  spiderIds: string[],
+): Promise<any> {
   const code = envValue(c, "TVBOX_ACCESS_CODE")
-
-  // 旧版 sources 参数与新版 sel 均由服务端签名，签名无效时降级为「全部源」，
-  // 不会越权（源路径始终由服务端白名单决定，客户端无法提交路径）。
-  const requested = (c.req.query("sources") || "").trim()
-  const sig = c.req.query("sig") || ""
-
-  // 新版订阅：sel = {n:[网盘id], s:[爬虫id]}，服务端签名
-  const selRaw = (c.req.query("sel") || "").trim()
-  let netdiskIds: string[] = []
-  let spiderIds: string[] = []
-  if (selRaw) {
-    const expected = await hmac(c, selRaw)
-    if (expected && constantTimeEqual(sig, expected)) {
-      try {
-        const parsed = JSON.parse(selRaw)
-        netdiskIds = Array.isArray(parsed?.n) ? parsed.n.map(String) : []
-        spiderIds = Array.isArray(parsed?.s) ? parsed.s.map(String) : []
-      } catch {}
-    }
-  }
-
   const cfg = await readConfig(c)
   const sites: any[] = []
 
@@ -378,14 +364,80 @@ tvboxRouter.get("/config.json", async (c) => {
     })
   }
 
+  if (!sites.length) {
+    sites.push({
+      key: "omnibox_netdisk",
+      name: "OmniBox 网盘",
+      type: 3,
+      api: netdiskParams.length ? `${apiUrl}?${netdiskParams.join("&")}` : apiUrl,
+      searchable: 1,
+      filterable: 0,
+      changeable: 0,
+    })
+  }
+
+  return { spider: "", sites, rules: {} }
+}
+
+/**
+ * 服务端短订阅端点：/@tvbox/sub/{订阅id}?token={订阅token}
+ * 源选择保存在服务端，链接里不再编码冗长的 sel 参数。
+ */
+tvboxRouter.get("/sub/:id", async (c) => {
+  const denied = await accessDenied(c)
+  if (denied) return denied
+
+  const id = c.req.param("id")
+  const token = c.req.query("token") || ""
+  const sub = await readSubscription(c, id, token)
+  if (!sub) {
+    return c.json({ code: 404, message: "subscription not found or token mismatch", spider: "", sites: [], rules: {} }, 404)
+  }
+  const netdiskIds: string[] = Array.isArray(sub.netdisk) ? sub.netdisk.map(String) : []
+  const spiderIds: string[] = Array.isArray(sub.spiders) ? sub.spiders.map(String) : []
+  return c.json(await buildConfigFromSelection(c, netdiskIds, spiderIds))
+})
+
+tvboxRouter.get("/config.json", async (c) => {
+  const denied = await accessDenied(c)
+  if (denied) return denied
+  const code = envValue(c, "TVBOX_ACCESS_CODE")
+
+  // 旧版 sources 参数与新版 sel 均由服务端签名，签名无效时降级为「全部源」，
+  // 不会越权（源路径始终由服务端白名单决定，客户端无法提交路径）。
+  const requested = (c.req.query("sources") || "").trim()
+  const sig = c.req.query("sig") || ""
+
+  // 新版订阅：sel = {n:[网盘id], s:[爬虫id]}，服务端签名
+  const selRaw = (c.req.query("sel") || "").trim()
+  let netdiskIds: string[] = []
+  let spiderIds: string[] = []
+  if (selRaw) {
+    const expected = await hmac(c, selRaw)
+    if (expected && constantTimeEqual(sig, expected)) {
+      try {
+        const parsed = JSON.parse(selRaw)
+        netdiskIds = Array.isArray(parsed?.n) ? parsed.n.map(String) : []
+        spiderIds = Array.isArray(parsed?.s) ? parsed.s.map(String) : []
+      } catch {}
+    }
+  }
+
+  // 用共享构造器生成基础配置（短链接端点走同一逻辑）
+  const config: any = await buildConfigFromSelection(c, netdiskIds, spiderIds)
+  const sites: any[] = config.sites
+
   // 兼容旧版 sources 参数（无 sel 时）
   if (!selRaw && requested) {
+    const cfg = await readConfig(c)
     const expected = await hmac(c, requested)
     if (expected && constantTimeEqual(sig, expected)) {
       const ids = requested.split(",").map((s) => s.trim()).filter(Boolean)
       const selected = ids.filter((id) => cfg.netdisk.some((s) => s.id === id)).join(",")
       if (selected) {
-        const params = netdiskParams.filter((p) => !p.startsWith("sources="))
+        const apiUrl = absoluteUrl(c, "/@tvbox/api")
+        const params: string[] = []
+        if (code) params.push(`code=${encodeURIComponent(code)}`)
         params.push(`sources=${encodeURIComponent(selected)}`)
         sites.length = 0
         sites.push({
@@ -401,19 +453,7 @@ tvboxRouter.get("/config.json", async (c) => {
     }
   }
 
-  if (!sites.length) {
-    sites.push({
-      key: "omnibox_netdisk",
-      name: "OmniBox 网盘",
-      type: 3,
-      api: netdiskParams.length ? `${apiUrl}?${netdiskParams.join("&")}` : apiUrl,
-      searchable: 1,
-      filterable: 0,
-      changeable: 0,
-    })
-  }
-
-  return c.json({ spider: "", sites, rules: {} })
+  return c.json(config)
 })
 
 tvboxRouter.get("/spider", async (c) => {
