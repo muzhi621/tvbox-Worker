@@ -50,9 +50,17 @@
 openssl rand -hex 24
 ```
 
+**`TVBOX_ACCESS_CODE`**
+
+订阅访问码，同时也是管理页口令。管理端点在未设置此变量时会主动返回 503。用随机串，例如 `tv_` 加 20 位字母数字。
+
+> 可以访问管理页 `/@tvbox/admin?code=你的访问码` 来配置源，不需要编辑 `TVBOX_SOURCES`。见第 5 步。
+
+### 可选（兜底）
+
 **`TVBOX_SOURCES`**
 
-JSON 数组，定义 TVBox 可以看到的目录白名单。例如：
+JSON 数组，定义目录白名单。只有在管理页还没保存过任何源时才会读取它，作为兜底。推荐直接用管理页配置。示例：
 
 ```json
 [
@@ -61,13 +69,12 @@ JSON 数组，定义 TVBox 可以看到的目录白名单。例如：
 ]
 ```
 
-> `path` 必须与稍后在 OpenList 管理后台看到的路径一致。可以先留一个占位值，部署完再去后台确认后回来改。
+> `path` 必须与 OpenList 管理后台看到的路径一致。
 
 ### 强烈建议
 
 | 变量 | 示例值 | 说明 |
 |---|---|---|
-| `TVBOX_ACCESS_CODE` | `a1b2c3d4random` | 订阅访问码，防止订阅地址被随手扫到 |
 | `ADMIN_PASS` | 你的强密码 | OpenList 管理后台密码 |
 | `DB_CIPHER` | `aes-256-gcm` | 加密落盘的网盘 Cookie / Token |
 | `DB_FORMAT` | `map` | 数据格式，固定这个值 |
@@ -92,6 +99,19 @@ JSON 数组，定义 TVBox 可以看到的目录白名单。例如：
 
 ## 第 5 步：拿到订阅地址
 
+### 方式 A：管理页生成（推荐）
+
+打开管理页：
+
+```
+https://你的域名/@tvbox/admin?code=你的访问码
+```
+
+在页面里从已挂载网盘目录添加源，勾选需要的源，点「生成订阅链接」并复制。
+详细操作见 [TVBOX_ADMIN_GUIDE.md](./TVBOX_ADMIN_GUIDE.md)。
+
+### 方式 B：直接访问
+
 在浏览器打开：
 
 ```
@@ -99,6 +119,7 @@ https://你的域名/@tvbox/config.json?code=你的访问码
 ```
 
 如果配置了 `TVBOX_ACCESS_CODE`，必须带 `code` 参数；没配置则直接访问 `/@tvbox/config.json`。
+不带 `sources` 参数时，订阅包含数据库（或环境变量）里配置的全部源。
 
 返回类似：
 
@@ -122,7 +143,7 @@ https://你的域名/@tvbox/config.json?code=你的访问码
 
 1. 打开 TVBox / FongMi / CatVod 类 App
 2. 设置 → 点播订阅 → 添加，填入上一步的 `config.json` 地址
-3. 返回首页，应看到名为「OpenList 网盘」的源，分类为你在 `TVBOX_SOURCES` 里配置的 `name`
+3. 返回首页，应看到名为「OpenList 网盘」的源，分类为管理页里配置的源名称（或 `TVBOX_SOURCES` 里的 `name`）
 4. 目录浏览可以看到视频文件，点播放会现取一条带签名的直链
 
 常见客户端已验证：FongMi TV、CatVodTV。

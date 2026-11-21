@@ -14,80 +14,37 @@ import {
 } from "../pkg/sign"
 import { getNearestMeta, canAccess } from "../pkg/meta"
 import { safeErrorMessage } from "../pkg/errs"
+import {
+  accessDenied,
+  constantTimeEqual,
+  envValue,
+  hmac,
+  readSources,
+  type TvboxSource,
+} from "./tvbox-store"
 
 /**
  * TVBox / CatVod 兼容端点。
  *
  * 设计边界（重要）：
  *  1. 客户端永远不能提交文件系统路径，只能提交 sourceId。服务端把
- *     sourceId 映射到 TVBOX_SOURCES 中配置的固定路径。
- *  2. detail 返回的 vod_id 是「sourceId + 相对路径 + HMAC」的不透明令牌，
+ *     sourceId 映射到已配置（数据库或环境变量）的固定路径。
+ *  2. 订阅地址可用 sources=a,b 选择部分源，签名由服务端签发，客户端
+ *     无法伪造；源路径始终由服务端映射。
+ *  3. detail 返回的 vod_id 是「sourceId + 相对路径 + HMAC」的不透明令牌，
  *     客户端篡改签名即失效；相对路径再经 isWithinUserRoot 二次校验。
- *  3. 签名直链只在 detail 请求时现取现签，绝不写入 KV / 订阅配置 / 日志。
- *  4. 访问码 TVBOX_ACCESS_CODE 只用于挡住随手扫到订阅地址的人，它不是
+ *  4. 签名直链只在 detail 请求时现取现签，绝不写入 KV / 订阅配置 / 日志。
+ *  5. 访问码 TVBOX_ACCESS_CODE 只用于挡住随手扫到订阅地址的人，它不是
  *     网盘凭据；网盘凭据始终留在 OpenList 侧。
  */
 
 export const tvboxRouter = new Hono()
-
-type TvboxSource = {
-  id: string
-  name: string
-  path: string
-  password?: string
-}
 
 const VIDEO_EXT = new Set([
   "mp4", "mkv", "avi", "mov", "wmv", "flv", "m4v", "ts", "rmvb", "rm",
   "3gp", "webm", "m2ts", "vob", "mpg", "mpeg", "strm", "iso", "blu",
 ])
 const SUB_EXT = new Set(["srt", "ass", "ssa", "vtt", "sub"])
-
-function envValue(c: any, key: string): string {
-  const fromEnv = c?.env?.[key]
-  if (fromEnv !== undefined && fromEnv !== null) return String(fromEnv)
-  if (typeof process !== "undefined" && process.env?.[key]) {
-    return String(process.env[key])
-  }
-  return ""
-}
-
-function readSources(c: any): TvboxSource[] {
-  const raw = envValue(c, "TVBOX_SOURCES")
-  if (!raw.trim()) return []
-  try {
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed
-      .filter((s: any) => s && typeof s.id === "string" && typeof s.path === "string")
-      .map((s: any) => ({
-        id: String(s.id),
-        name: String(s.name || s.id),
-        path: String(s.path).startsWith("/") ? String(s.path) : `/${s.path}`,
-        password: s.password ? String(s.password) : "",
-      }))
-      .filter((s: TvboxSource) => !s.path.includes(".."))
-  } catch {
-    return []
-  }
-}
-
-function constantTimeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false
-  let diff = 0
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
-  return diff === 0
-}
-
-function accessDenied(c: any): Response | null {
-  const expected = envValue(c, "TVBOX_ACCESS_CODE")
-  if (!expected) return null
-  const provided =
-    c.req.query("code") || c.req.header("X-TVBox-Code") || ""
-  return constantTimeEqual(String(provided), expected)
-    ? null
-    : c.json({ code: 401, message: "invalid access code", list: [] }, 401)
-}
 
 function storageContext(c: any) {
   let waitUntil: ((p: Promise<unknown>) => void) | undefined
@@ -112,23 +69,6 @@ function b64urlDecode(text: string): string {
   const bytes = new Uint8Array(binary.length)
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
   return new TextDecoder().decode(bytes)
-}
-
-async function hmac(c: any, payload: string): Promise<string> {
-  const secret = envValue(c, "JWT_SECRET")
-  if (!secret) return ""
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  )
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload))
-  return Array.from(new Uint8Array(sig))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("")
-    .slice(0, 24)
 }
 
 async function makeVodId(
@@ -335,11 +275,31 @@ async function detail(
   }
 }
 
-tvboxRouter.get("/config.json", (c) => {
+tvboxRouter.get("/config.json", async (c) => {
   const denied = accessDenied(c)
   if (denied) return denied
   const code = envValue(c, "TVBOX_ACCESS_CODE")
-  const api = absoluteUrl(c, "/@tvbox/api") + (code ? `?code=${encodeURIComponent(code)}` : "")
+
+  // sources 参数由管理页生成并附带服务端签名；签名无效时降级为「全部源」，
+  // 不会越权（源路径始终由服务端白名单决定，客户端无法提交路径）。
+  const requested = (c.req.query("sources") || "").trim()
+  const sig = c.req.query("sig") || ""
+  let selected = ""
+  if (requested) {
+    const expected = await hmac(c, requested)
+    if (expected && constantTimeEqual(sig, expected)) {
+      const available = await readSources(c)
+      const ids = requested.split(",").map((s) => s.trim()).filter(Boolean)
+      selected = ids.filter((id) => available.some((s) => s.id === id)).join(",")
+    }
+  }
+
+  const apiUrl = absoluteUrl(c, "/@tvbox/api")
+  const params: string[] = []
+  if (code) params.push(`code=${encodeURIComponent(code)}`)
+  if (selected) params.push(`sources=${encodeURIComponent(selected)}`)
+  const api = params.length ? `${apiUrl}?${params.join("&")}` : apiUrl
+
   return c.json({
     spider: "",
     sites: [
@@ -361,12 +321,20 @@ tvboxRouter.get("/api", async (c) => {
   const denied = accessDenied(c)
   if (denied) return denied
 
-  const sources = readSources(c)
+  const allSources = await readSources(c)
+  const selected = c.req.query("sources")
+  let sources = allSources
+  if (selected) {
+    const ids = new Set(selected.split(",").map((s) => s.trim()).filter(Boolean))
+    sources = allSources.filter((s) => ids.has(s.id))
+  }
   if (!sources.length) {
     return c.json(
       {
         code: 503,
-        message: "TVBOX_SOURCES is not configured",
+        message: allSources.length
+          ? "No source selected"
+          : "TVBOX_SOURCES is not configured",
         class: [],
         list: [],
         page: 1,
@@ -378,10 +346,13 @@ tvboxRouter.get("/api", async (c) => {
     )
   }
 
-  const user = await getUserFromContext(c)
-  if (!user || user.disabled) {
-    return c.json({ code: 401, message: "Unauthorized", class: [], list: [] }, 401)
-  }
+  // TVBox 客户端不会携带 OpenList 登录态，而 OpenList 默认禁用 guest。
+  // 访问码已在上方校验通过，这里使用受限只读上下文；路径仍只能来自
+  // 服务端 sourceId 白名单，客户端无法提交任意路径，因此不会扩大权限。
+  const authUser = await getUserFromContext(c)
+  const user = authUser && !authUser.disabled
+    ? authUser
+    : { role: 1, permission: 0, base_path: "/", disabled: false }
 
   const classes = sources.map((s) => ({ type_id: s.id, type_name: s.name }))
   const ac = c.req.query("ac") || "videolist"

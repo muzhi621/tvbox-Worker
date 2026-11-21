@@ -12,6 +12,7 @@ import { s3Router } from "./server/s3"
 import { setEnvCtx } from "./internal/model/db"
 import { embyRouter, subsonicRouter } from "./server/emby"
 import { tvboxRouter } from "./server/tvbox"
+import { tvboxAdminRouter } from "./server/tvbox-admin"
 import { getStoreConfigErrorDetail } from "./internal/model/store/backend"
 import { storageErrorSummary, uiStorageError } from "./server/storage-error"
 
@@ -180,6 +181,7 @@ app.route("/@rest", subsonicRouter)
 
 // TVBox / CatVod 兼容端点，必须在 SPA 兜底之前挂载
 app.route("/@tvbox", tvboxRouter)
+app.route("/@tvbox", tvboxAdminRouter)
 
 // 内嵌品牌资源（logo/favicon），必须在 SPA 兜底 app.all("*") 之前挂载
 app.route("/", assetsRouter)
