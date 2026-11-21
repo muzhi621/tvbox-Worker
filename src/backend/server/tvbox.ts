@@ -301,7 +301,7 @@ async function detail(
 }
 
 tvboxRouter.get("/config.json", async (c) => {
-  const denied = accessDenied(c)
+  const denied = await accessDenied(c)
   if (denied) return denied
   const code = envValue(c, "TVBOX_ACCESS_CODE")
 
@@ -406,7 +406,7 @@ tvboxRouter.get("/config.json", async (c) => {
 })
 
 tvboxRouter.get("/spider", async (c) => {
-  const denied = accessDenied(c)
+  const denied = await accessDenied(c)
   if (denied) return denied
 
   const cfg = await readConfig(c)
@@ -437,8 +437,8 @@ tvboxRouter.get("/spider", async (c) => {
       const playId = b64urlDecode(parts[2] || "")
       const sp = spiders.find((s) => s.id === sid)
       if (!sp) return c.json({ code: 404, message: "spider not found", list: [] }, 404)
-      const detailRes = await runSpider(sp, "detail", { playId, id: playId }, { from: "detail" })
-      const playRes = await runSpider(sp, "play", { playId }, { from: "play" })
+      const detailRes = await runSpider(sp, "detail", { playId, id: playId }, { from: "detail", env: c.env })
+      const playRes = await runSpider(sp, "play", { playId }, { from: "play", env: c.env })
       const base = detailRes.data?.list?.[0] || detailRes.data || {}
       const playData = playRes.data || {}
       const urls = Array.isArray(playData.urls) ? playData.urls : []
@@ -469,7 +469,7 @@ tvboxRouter.get("/spider", async (c) => {
             : method === "category"
               ? { categoryId: c.req.query("categoryId") || c.req.query("pg") || "1", page }
               : { page }
-        const res = await runSpider(sp, method, params, { from: method })
+        const res = await runSpider(sp, method, params, { from: method, env: c.env })
         if (!res.ok) {
           console.warn(`[tvbox] spider ${sp.id}.${method} failed: ${res.error}`)
           continue
@@ -494,7 +494,7 @@ tvboxRouter.get("/spider", async (c) => {
 })
 
 tvboxRouter.get("/api", async (c) => {
-  const denied = accessDenied(c)
+  const denied = await accessDenied(c)
   if (denied) return denied
 
   const allSources = await readSources(c)

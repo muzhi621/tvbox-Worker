@@ -32,7 +32,13 @@ function absoluteUrl(c: any, path: string): string {
   return `${origin}${path.startsWith("/") ? path : `/${path}`}`
 }
 
-type MountOption = { path: string; driver: string; remark: string }
+type MountOption = {
+  id: number
+  path: string
+  driver: string
+  remark: string
+  status: string
+}
 
 export async function readMounts(c: any): Promise<MountOption[]> {
   try {
@@ -40,9 +46,11 @@ export async function readMounts(c: any): Promise<MountOption[]> {
     return (db.storages || [])
       .filter((s: any) => s && !s.disabled && s.mount_path)
       .map((s: any) => ({
+        id: Number(s.id) || 0,
         path: String(s.mount_path),
         driver: String(s.driver || ""),
         remark: String(s.remark || ""),
+        status: String(s.status || ""),
       }))
       .sort((a: MountOption, b: MountOption) => a.path.localeCompare(b.path))
   } catch {

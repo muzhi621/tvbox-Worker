@@ -23,6 +23,18 @@ export type SpiderSource = {
   code: string
   doc?: string
   enabled: boolean
+  // OmniBox 2.x 风格元数据（从 OmniBox-Spider 库同步时自动填充）
+  type?: "JavaScript" | "Python"
+  category?: string
+  priority?: number
+  tags?: string[]
+  version?: string
+  author?: string
+  sourceRepo?: string
+  path?: string
+  updatedAt?: string
+  nav?: boolean
+  push?: boolean
 }
 
 export type OmniBoxConfig = {
@@ -119,6 +131,17 @@ function normalizeSpiders(input: any): SpiderSource[] {
       code,
       doc: s.doc ? String(s.doc).slice(0, 4000) : "",
       enabled: s.enabled !== false,
+      type: s.type === "Python" ? "Python" : "JavaScript",
+      category: s.category ? String(s.category).slice(0, 40) : "",
+      priority: Number.isFinite(Number(s.priority)) ? Number(s.priority) : 50,
+      tags: Array.isArray(s.tags) ? s.tags.map((t: any) => String(t).slice(0, 24)).slice(0, 6) : [],
+      version: s.version ? String(s.version).slice(0, 40) : "",
+      author: s.author ? String(s.author).slice(0, 60) : "",
+      sourceRepo: s.sourceRepo ? String(s.sourceRepo).slice(0, 120) : "",
+      path: s.path ? String(s.path).slice(0, 240) : "",
+      updatedAt: s.updatedAt ? String(s.updatedAt).slice(0, 40) : "",
+      nav: !!s.nav,
+      push: !!s.push,
     })
     if (out.length >= 100) break
   }

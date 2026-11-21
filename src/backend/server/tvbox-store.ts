@@ -39,23 +39,46 @@ export function constantTimeEqual(a: string, b: string): boolean {
 }
 
 /**
+ * 订阅令牌校验：每个订阅可生成独立 token，TVBox 链接只带 token 即可访问。
+ * token 只授予读取订阅数据的权限，不能访问 /@omnibox 管理接口。
+ */
+export async function isSubscriptionToken(c: any, token: string): Promise<boolean> {
+  if (!token) return false
+  try {
+    const db = await getDb(c.env)
+    const row = (db.settings || []).find((s: any) => s && s.key === "omnibox_subscriptions")
+    if (!row || typeof row.value !== "string") return false
+    const list = JSON.parse(row.value)
+    if (!Array.isArray(list)) return false
+    return list.some(
+      (s: any) =>
+        s && !s.disabled && constantTimeEqual(String(s.token || ""), String(token)),
+    )
+  } catch {
+    return false
+  }
+}
+
+/**
  * 访问码校验。requireCode=true 时（管理 API）若未配置访问码直接拒绝，
  * 避免管理端点在未设置访问码的部署上完全暴露。
+ * 非管理端点额外接受订阅令牌，便于每条订阅使用独立链接。
  */
-export function accessDenied(c: any, requireCode = false): Response | null {
+export async function accessDenied(c: any, requireCode = false): Promise<Response | null> {
   const expected = envValue(c, "TVBOX_ACCESS_CODE")
+  const provided =
+    c.req.query("code") || c.req.query("token") || c.req.header("X-TVBox-Code") || ""
+  // 兼容旧部署：未设置访问码且不是管理接口时保持开放
+  if (!expected && !requireCode) return null
   if (!expected) {
-    return requireCode
-      ? c.json(
-          { code: 503, message: "TVBOX_ACCESS_CODE is required for management", list: [] },
-          503,
-        )
-      : null
+    return c.json(
+      { code: 503, message: "TVBOX_ACCESS_CODE is required for management", list: [] },
+      503,
+    )
   }
-  const provided = c.req.query("code") || c.req.header("X-TVBox-Code") || ""
-  return constantTimeEqual(String(provided), expected)
-    ? null
-    : c.json({ code: 401, message: "invalid access code", list: [] }, 401)
+  if (constantTimeEqual(String(provided), expected)) return null
+  if (!requireCode && (await isSubscriptionToken(c, String(provided)))) return null
+  return c.json({ code: 401, message: "invalid access code", list: [] }, 401)
 }
 
 export async function hmac(c: any, payload: string): Promise<string> {

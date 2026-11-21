@@ -18,6 +18,25 @@ import * as parse5 from "parse5"
 const DEFAULT_TIMEOUT = 15000
 const MAX_CODE_BYTES = 512 * 1024
 
+/**
+ * 默认库脚本来自公开仓库，不能把部署环境变量整体暴露给沙箱。
+ * 这里只放行非敏感键；脚本自带的默认值仍然可用。
+ */
+const SENSITIVE_ENV =
+  /(SECRET|TOKEN|PASSWORD|PASSWD|COOKIE|ACCESS_CODE|JWT|DB_|DATABASE|CREDENTIAL|PRIVATE_KEY|API_KEY)/i
+
+function safeScriptEnv(env: any): Record<string, string> {
+  const src = env && typeof env === "object" ? env : process.env || {}
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(src)) {
+    if (SENSITIVE_ENV.test(k) || v === undefined || v === null) continue
+    try {
+      out[k] = typeof v === "string" ? v : JSON.stringify(v)
+    } catch {}
+  }
+  return out
+}
+
 export type SpiderModule = {
   home?: (params: any, ctx: any) => Promise<any>
   category?: (params: any, ctx: any) => Promise<any>
@@ -318,10 +337,32 @@ export async function runSpider(
     },
   })
 
+  const scriptEnv = safeScriptEnv(context?.env)
   const requireShim = (name: string) => {
     if (name === "omnibox_sdk") return sdk
     if (name === "cheerio") return cheerioShim()
-    if (name === "spider_runner") return { run: () => {} }
+    if (name === "spider_runner") return { run: () => {}, OmniBox: sdk }
+    if (name === "vm" || name === "node:vm") {
+      return {
+        createContext: (sandbox: any, opts?: any) =>
+          vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false }, ...opts }),
+        Script: vm.Script,
+        runInNewContext(code: string, sandbox: any = {}) {
+          const nested: any = {
+            ...sandbox,
+            require: requireShim,
+            module: { exports: {} },
+            exports: {},
+            console: sandbox.console || console,
+            fetch,
+            process: { env: scriptEnv },
+          }
+          const ctx = vm.createContext(nested, { codeGeneration: { strings: false, wasm: false } })
+          new vm.Script(code).runInContext(ctx, { timeout: 5000 })
+          return nested.module.exports
+        },
+      }
+    }
     if (name === "axios") {
       return {
         create: () => ({
@@ -337,6 +378,14 @@ export async function runSpider(
     if (name === "https") return { Agent: class {} }
     if (name === "http") return {}
     if (name === "crypto" || name === "node:crypto") return globalThis.crypto
+    // 常见安全 Node 内置模块：云函数运行时提供，失败则明确拒绝
+    if (/^(path|querystring|url|util|buffer|node:path|node:querystring|node:url|node:util|node:buffer)$/.test(name)) {
+      if (typeof require === "function") {
+        try {
+          return require(name)
+        } catch {}
+      }
+    }
     throw new Error(`unsupported module: ${name}`)
   }
 
@@ -344,7 +393,7 @@ export async function runSpider(
     require: requireShim,
     module: { exports: {} },
     exports: {},
-    process: { env: process.env || {} },
+    process: { env: scriptEnv, platform: "browser", version: "v22.0.0" },
     console: {
       log: (...a: any[]) => sdk.log(...a),
       warn: (...a: any[]) => sdk.log("[warn]", ...a),

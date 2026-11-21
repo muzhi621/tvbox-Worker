@@ -15,6 +15,8 @@ import { scrapeMedia } from "../internal/media/scrape"
 import { scanMedia, getScanProgress, isScanRunning } from "../internal/media/scan"
 import { readMounts } from "./tvbox-admin"
 import { runSpider } from "./spider-runner"
+import { registerSpiderLibraryRoutes } from "./spider-library"
+import { registerOmniBoxDataRoutes } from "./omnibox-extra"
 import {
   accessDenied,
   envValue,
@@ -39,6 +41,10 @@ omniboxRouter.use("*", async (c, next) => {
   if (denied) return denied
   await next()
 })
+
+// 默认 Spider 库、通用管理数据（解析资源/任务/订阅/插件）
+registerSpiderLibraryRoutes(omniboxRouter)
+registerOmniBoxDataRoutes(omniboxRouter)
 
 function absoluteUrl(c: any, path: string): string {
   const origin = new URL(c.req.url).origin
@@ -197,6 +203,20 @@ omniboxRouter.post("/mounts/add", async (c) => {
     },
     connectError ? 500 : 200,
   )
+})
+
+omniboxRouter.post("/mounts/delete", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const id = Number(body.id || 0)
+  if (!id) return c.json({ code: 400, message: "missing id" }, 400)
+  const db = await getDb(c.env)
+  const before = (db.storages || []).length
+  db.storages = (db.storages || []).filter((s: any) => Number(s.id) !== id)
+  if ((db.storages || []).length === before) {
+    return c.json({ code: 404, message: "storage not found" }, 404)
+  }
+  await saveDb(db, c.env)
+  return c.json({ code: 200, message: "deleted" })
 })
 
 // ---------- 媒体库 ----------
@@ -370,6 +390,17 @@ omniboxRouter.post("/sources/spiders", async (c) => {
       code,
       doc: s.doc ? String(s.doc).slice(0, 4000) : "",
       enabled: s.enabled !== false,
+      type: s.type === "Python" ? "Python" : "JavaScript",
+      category: s.category ? String(s.category).slice(0, 40) : "",
+      priority: Number.isFinite(Number(s.priority)) ? Number(s.priority) : 50,
+      tags: Array.isArray(s.tags) ? s.tags.map((t: any) => String(t).slice(0, 24)).slice(0, 6) : [],
+      version: s.version ? String(s.version).slice(0, 40) : "",
+      author: s.author ? String(s.author).slice(0, 60) : "",
+      sourceRepo: s.sourceRepo ? String(s.sourceRepo).slice(0, 120) : "",
+      path: s.path ? String(s.path).slice(0, 240) : "",
+      updatedAt: s.updatedAt || new Date().toISOString(),
+      nav: !!s.nav,
+      push: !!s.push,
     })
   }
   cfg.spiders = list
@@ -389,7 +420,7 @@ omniboxRouter.post("/spider/test", async (c) => {
     { id: "test", name: "test", code },
     method,
     params,
-    { from: method },
+    { from: method, env: c.env },
   )
   return c.json({ code: result.ok ? 200 : 500, data: result })
 })
@@ -402,7 +433,7 @@ omniboxRouter.post("/spider/call", async (c) => {
   const cfg = await readConfig(c)
   const source = cfg.spiders.find((s) => s.id === id && s.enabled)
   if (!source) return c.json({ code: 404, message: "spider not found" }, 404)
-  const result = await runSpider(source, method, params, { from: method })
+  const result = await runSpider(source, method, params, { from: method, env: c.env })
   if (!result.ok) return c.json({ code: 500, message: result.error }, 500)
   return c.json({ code: 200, data: result.data, ms: result.ms })
 })
@@ -419,8 +450,11 @@ omniboxRouter.post("/subscribe", async (c) => {
   const payload = JSON.stringify({ n: validNetdisk, s: validSpiders })
   const sig = await hmac(c, payload)
   const code = envValue(c, "TVBOX_ACCESS_CODE")
+  const token = String(body.token || "").trim()
   const params: string[] = []
-  if (code) params.push(`code=${encodeURIComponent(code)}`)
+  // 每条订阅可用自己的访问令牌；未指定令牌时兼容旧链接（直接使用访问码）
+  if (token) params.push(`token=${encodeURIComponent(token)}`)
+  else if (code) params.push(`code=${encodeURIComponent(code)}`)
   params.push(`sel=${encodeURIComponent(payload)}`)
   params.push(`sig=${encodeURIComponent(sig)}`)
   const url = `${absoluteUrl(c, "/@tvbox/config.json")}?${params.join("&")}`
