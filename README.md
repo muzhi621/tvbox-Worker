@@ -1,108 +1,135 @@
-# tvbox-Worker
+# OmniBox Worker
 
-把 [OpenList-Worker](https://github.com/OpenListTeam/OpenList-Worker) 改造成 TVBox / CatVod 可直接使用的网盘源，**不需要额外运行任何网关服务**。
+借用 [OpenList-Worker](https://github.com/OpenListTeam/OpenList-Worker) 的核心驱动层，复刻 OmniBox 2.0 的核心体验：**网盘挂载 → 媒体库 → 爬虫源 → 发布订阅**，部署在腾讯云 EdgeOne Pages 云函数上，**不需要额外运行网关服务器**。
 
-部署在腾讯云 EdgeOne Pages 云函数上，网盘账号与 Cookie 留在服务端，TVBox 客户端只拿到一条订阅地址。
+网盘账号与 Cookie 留在服务端，TVBox 客户端只拿到一条订阅地址。
 
 ```
-TVBox  ──▶ /@tvbox/config.json  ──▶ 订阅配置
-       ──▶ /@tvbox/api          ──▶ 目录 / 搜索 / 播放（MACCMS 格式）
+浏览器 ──▶ /@omnibox/*        ──▶ OmniBox 风格管理界面（概览/媒体库/网盘/爬虫/订阅）
                                       │
-                                      ▼ 进程内调用（非 HTTP）
-                          OpenList 存储驱动层（listItems / getItem）
+TVBox  ──▶ /@tvbox/config.json ──▶ 订阅配置（网盘站 + 爬虫站）
+       ──▶ /@tvbox/api         ──▶ 网盘目录（MACCMS）
+       ──▶ /@tvbox/spider      ──▶ 爬虫源（MACCMS）
                                       │
+                    进程内调用（非 HTTP）
                                       ▼
-                          阿里云盘 / 115 / 夸克 / PikPak / ...
+             OpenList 驱动层 (listItems/getItem)  +  爬虫沙箱 (node:vm)
+                                      ▼
+                    阿里云盘 / 115 / 夸克 / PikPak / 采集站 ...
 ```
 
-## 与上游的区别
+## 保留与裁剪
 
-本项目 fork 自 OpenList-Worker（AGPL-3.0），增加了 TVBox 协议端点和一个可视化源管理页：
+本项目 fork 自 OpenList-Worker（AGPL-3.0），采用"体验复刻"策略：**保留后端核心，替换前端，关闭无关协议端点**。
 
-| 文件 | 改动 |
+| 类别 | 内容 |
 |---|---|
-| `src/backend/server/tvbox.ts` | `/@tvbox` 协议端点，输出 TVBox 订阅与 MACCMS 数据 |
-| `src/backend/server/tvbox-store.ts` | 源配置持久化（settings 表）+ 访问码/HMAC 工具 |
-| `src/backend/server/tvbox-admin.ts` | `/@tvbox/admin` 管理页 + `/@tvbox/manage/*` API |
-| `src/backend/index.ts` | 挂载两个路由（位于 SPA 兜底之前） |
+| **保留** | 75+ 网盘/分享驱动、`op/storage` 与搜索、数据库与 KV/Blob 持久化、权限/签名中间件、播放直链 `/api/d`、`/api/p`、挂载 API `/api/admin/storage/*`、媒体库扫描与刮削 |
+| **新增** | OmniBox 单页 UI、`/@omnibox` 统一入口、爬虫沙箱运行器、TVBox 爬虫端点、双源订阅 |
+| **移除** | Emby / Subsonic / WebDAV / S3 协议端点、根级短路径、OpenList 官方前端（23MB → 19KB 自建单页） |
 
-其余存储驱动、鉴权、KV/Blob 持久化、安全中间件全部沿用上游。[上游 README](./README-UPSTREAM.md) 保留供查阅。
+前端不再是 OpenList 官方界面，而是 `ui/index.html` 单页（构建时复制为 `dist/index.html`）。
 
-## 两种配置方式
+| 文件 | 作用 |
+|---|---|
+| `ui/index.html` | OmniBox 风格单页管理界面 |
+| `src/backend/server/omnibox.ts` | `/@omnibox` 概览/媒体库/挂载/源/订阅 API |
+| `src/backend/server/omnibox-store.ts` | 双类型源配置持久化 + 访问码/HMAC |
+| `src/backend/server/spider-runner.ts` | OmniBox JS 爬虫沙箱（omnibox_sdk / cheerio shim） |
+| `src/backend/server/tvbox.ts` | TVBox 协议端点（网盘 + 爬虫，MACCMS） |
+| `scripts/copy-ui.mjs` | 用自建 UI 替代 OpenList 前端下载 |
 
-1. **管理页（推荐）**：打开 `/@tvbox/admin?code=你的访问码`，从已挂载网盘目录中选源、勾选、生成订阅链接。配置存在数据库里，不需要编辑环境变量。详见 [TVBOX_ADMIN_GUIDE.md](./TVBOX_ADMIN_GUIDE.md)。
-2. **环境变量**：沿用 `TVBOX_SOURCES` JSON。仅当数据库里没有源配置时生效，作为兜底。
+## 功能模块
+
+1. **概览**：网盘数、源数量、媒体条目与刮削状态
+2. **网盘挂载**：复用 OpenList 驱动（115/123/阿里云盘/PikPak/夸克等分享驱动），在 OpenList 后台完成挂载
+3. **网盘源**：把已挂载目录登记为 TVBox 可浏览的源
+4. **爬虫源**：导入 OmniBox JS 脚本（`module.exports = { home, category, detail, search, play }`），沙箱内执行
+5. **媒体库**：扫描网盘目录，TMDB 刮削海报，海报墙展示；TVBox 目录浏览不受影响
+6. **订阅**：勾选网盘源与爬虫源，生成一条带签名的 TVBox 订阅地址
+
+详细使用见 [OMNIBOX_GUIDE.md](./OMNIBOX_GUIDE.md)。
 
 ## 安全边界
 
-- 客户端**只能传 sourceId**，不能传文件路径。服务端把 sourceId 映射到已配置（数据库或环境变量）的固定路径，并用 `isWithinUserRoot` 二次校验。
-- 订阅链接可用 `sources=a,b` 选择部分源，签名由服务端签发并放在 `sig` 参数中；签名无效时降级为全部源，不会越权。
-- `vod_id` 是「sourceId + 相对路径 + HMAC」的不透明令牌，签名来自 `JWT_SECRET`，客户端篡改即失效。
-- 播放直链在 detail 请求时**现取现签**，不写入 KV、不进入订阅配置、不打印到日志。
-- `TVBOX_ACCESS_CODE` 只用于挡住随手扫到订阅地址的人，它不是网盘凭据；管理端点在没有配置访问码时会主动关闭（503）。
-- TVBox 客户端不携带 OpenList 登录态，访问码校验通过后使用只读上下文；可见路径仍受 sourceId 白名单约束。
-- 管理页只读取挂载点的路径与备注，不返回 `addition`（含网盘 Token / Cookie）。建议开启 `DB_CIPHER=aes-256-gcm`。
+- 管理入口强制要求 `TVBOX_ACCESS_CODE`（未配置时返回 503）
+- 客户端只能传 sourceId，路径由服务端白名单映射，`isWithinUserRoot` 二次校验
+- 订阅 `sel` 参数与 `vod_id` 均带 HMAC 签名（来自 `JWT_SECRET`），篡改失效
+- 播放直链 detail 时现取现签，不写 KV、不入订阅、不打日志
+- 爬虫脚本在 `node:vm` 沙箱运行，超时 15 秒；`sniffVideo`/刮削/弹幕/网盘等需 Chromium 或后端状态的能力降级为空
+- 管理界面不返回 `addition`（网盘 Token/Cookie）；建议开启 `DB_CIPHER=aes-256-gcm`
 
 ## 环境变量
 
-在 EdgeOne 项目的「环境变量」里配置：
-
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `JWT_SECRET` | 是 | ≥16 位随机串。JWT 签名 + `vod_id` HMAC + 可选字段加密 |
-| `TVBOX_SOURCES` | 否 | JSON 数组，目录白名单兜底；管理页保存过源后以数据库为准 |
-| `TVBOX_ACCESS_CODE` | 是 | 订阅访问码，同时是管理页口令，务必设置随机串 |
-| `ADMIN_PASS` | 建议 | OpenList 管理后台密码 |
+| `JWT_SECRET` | 是 | ≥16 位随机串，签名 + 字段加密 |
+| `TVBOX_ACCESS_CODE` | 是 | 管理页口令 + 订阅访问码，务必设随机串 |
+| `ADMIN_PASS` | 建议 | OpenList 管理后台密码（挂载网盘用） |
 | `DB_FORMAT` | 否 | 固定 `map` |
-| `DB_DRIVER` | 否 | EdgeOne 上推荐 `blob`（零配置）或 `kv` |
-| `DB_CIPHER` | 建议 | `aes-256-gcm`，加密落盘的网盘凭据 |
+| `DB_DRIVER` | 否 | EdgeOne 推荐 `blob`（零配置）或 `kv` |
+| `DB_CIPHER` | 建议 | `aes-256-gcm`，加密落盘凭据 |
+| `TVBOX_SOURCES` | 否 | JSON 数组，网盘源兜底；界面保存后以数据库为准 |
 
-`TVBOX_SOURCES` 示例：
+EdgeOne 环境变量可整段粘贴：
 
-```json
-[
-  { "id": "movie", "name": "电影", "path": "/阿里云盘/电影" },
-  { "id": "series", "name": "剧集", "path": "/115/电视剧" },
-  { "id": "anime", "name": "动画", "path": "/夸克/动画", "password": "" }
-]
 ```
-
-- `id`：英文/数字，给 TVBox 传的 sourceId，不要含特殊字符
-- `name`：TVBox 里显示的分类名
-- `path`：OpenList 里的**绝对路径**，即管理后台存储挂载后看到的路径
-- `password`：可选，仅当该目录被 OpenList 密码保护时填写
+JWT_SECRET=<随机串>
+TVBOX_ACCESS_CODE=<随机串>
+ADMIN_PASS=<强密码>
+DB_FORMAT=map
+DB_DRIVER=blob
+DB_CIPHER=aes-256-gcm
+```
 
 ## 部署到 EdgeOne
 
-完整步骤见 [DEPLOY_EDGEONE.md](./DEPLOY_EDGEONE.md)。
+完整步骤见 [DEPLOY_EDGEONE.md](./DEPLOY_EDGEONE.md)。构建配置：
+
+| 配置项 | 值 |
+|---|---|
+| 安装命令 | `pnpm install --no-frozen-lockfile` |
+| 构建命令 | `pnpm run build` |
+| 输出目录 | `dist` |
+| Node 版本 | 22.x |
+
+部署后打开 `https://你的域名/@omnibox/?code=你的访问码` 进入管理界面（根路径 `/` 是 OpenList 后台，用于挂载网盘）。
 
 ## 接口
 
 | 路径 | 说明 |
 |---|---|
-| `GET /@tvbox/admin?code=xxx` | 可视化源管理页 |
-| `GET /@tvbox/manage/data?code=xxx` | 读取当前源与可挂载目录（不含凭据） |
-| `POST /@tvbox/manage/save?code=xxx` | 保存源配置 |
-| `POST /@tvbox/manage/link?code=xxx` | 生成带签名的订阅链接 |
-| `GET /@tvbox/config.json?code=xxx` | TVBox 订阅配置 |
-| `GET /@tvbox/config.json?code=xxx&sources=a,b&sig=xxx` | 只含指定源的订阅配置 |
-| `GET /@tvbox/api?code=xxx&ac=videolist&t=movie&pg=1` | 列目录 |
-| `GET /@tvbox/api?code=xxx&ac=search&wd=关键词` | 全库搜索 |
-| `GET /@tvbox/api?code=xxx&ac=videolist&ids=<vod_id>` | 详情 + 播放直链 |
-| `GET /@tvbox/api?code=xxx&ac=list` | 只返回分类列表 |
+| `GET /@omnibox/?code=xxx` | OmniBox 单页管理界面 |
+| `GET /@omnibox/status\|mounts\|sources\|media?code=xxx` | 数据与状态查询 |
+| `POST /@omnibox/sources/netdisk\|spiders?code=xxx` | 保存源 |
+| `POST /@omnibox/media/scan\|scrape\|tmdb-key?code=xxx` | 媒体库操作 |
+| `POST /@omnibox/spider/test\|call?code=xxx` | 爬虫调试 |
+| `POST /@omnibox/subscribe?code=xxx` | 生成订阅链接 |
+| `GET /@tvbox/config.json?code=xxx` | 订阅配置（全部源） |
+| `GET /@tvbox/config.json?code=xxx&sel=<json>&sig=xxx` | 订阅配置（指定源） |
+| `GET /@tvbox/api?code=xxx&...` | 网盘 MACCMS 数据 |
+| `GET /@tvbox/spider?code=xxx&...` | 爬虫 MACCMS 数据 |
 
 ## 本地开发
 
 ```bash
 pnpm install --no-frozen-lockfile
-cp .env.example .env.local   # 填入 JWT_SECRET / TVBOX_SOURCES
+cp .env.example .env.local   # 填 JWT_SECRET / TVBOX_ACCESS_CODE
 pnpm dev:worker
 ```
 
-访问 `http://localhost:8787/@tvbox/config.json` 验证。
+访问 `http://localhost:8787/@omnibox/?code=你的访问码`。
+
+## 限制
+
+- EdgeOne 无 Chromium：依赖 `OmniBox.sniffVideo` 的爬虫脚本可解析列表，但播放直链能力受限
+- 爬虫脚本来自管理员自行导入，不与官方脚本仓库自动同步；上游站点改版需自行维护
+- TMDB 刮削需申请 TMDB API Key；未配置时部分元数据不可用
+- Follow 上游更新时，本项目改动集中在 6 个新增文件 + `index.ts`/`package.json`/构建脚本
 
 ## 许可与致谢
 
 - 上游：[OpenListTeam/OpenList-Worker](https://github.com/OpenListTeam/OpenList-Worker)，AGPL-3.0
+- 爬虫脚本生态参考：[Silent1566/OmniBox-Spider](https://github.com/Silent1566/OmniBox-Spider)
 - 本项目同样以 AGPL-3.0 开源。若对外提供修改版服务，需公开相应源码。
-- 请只接入你有权访问的内容；网盘账号的风控、限速由使用者自行承担。
+- 请只接入你有权访问的内容；网盘风控、限速与内容合规由使用者自行承担。

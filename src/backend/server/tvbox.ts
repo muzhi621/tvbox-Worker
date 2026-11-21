@@ -20,8 +20,10 @@ import {
   envValue,
   hmac,
   readSources,
+  readConfig,
   type TvboxSource,
 } from "./tvbox-store"
+import { runSpider } from "./spider-runner"
 
 /**
  * TVBox / CatVod 兼容端点。
@@ -45,6 +47,29 @@ const VIDEO_EXT = new Set([
   "3gp", "webm", "m2ts", "vob", "mpg", "mpeg", "strm", "iso", "blu",
 ])
 const SUB_EXT = new Set(["srt", "ass", "ssa", "vtt", "sub"])
+
+type SpiderRef = { id: string; name: string; code: string }
+
+/** OmniBox 脚本返回的视频对象 → MACCMS 字段 */
+function fromSpiderVod(v: any, spiderId: string, spiderName: string): any {
+  const playId = String(v?.vod_id ?? v?.id ?? v?.playId ?? "")
+  const playUrl = v?.vod_play_url || v?.url || ""
+  return {
+    vod_id: `spider:${spiderId}:${b64urlEncode(playId)}`,
+    vod_name: String(v?.vod_name || v?.title || v?.name || "未命名"),
+    vod_pic: String(v?.vod_pic || v?.pic || ""),
+    vod_remarks: String(v?.vod_remarks || v?.remark || ""),
+    type_id: spiderId,
+    type_name: spiderName,
+    vod_year: String(v?.vod_year || v?.year || ""),
+    vod_actor: String(v?.vod_actor || v?.actors || ""),
+    vod_director: String(v?.vod_director || v?.director || ""),
+    vod_content: String(v?.vod_content || v?.description || v?.plot || ""),
+    vod_play_from: String(v?.vod_play_from || "OmniBox"),
+    vod_play_url: typeof playUrl === "string" ? playUrl : "",
+    vod_tag: "spider",
+  }
+}
 
 function storageContext(c: any) {
   let waitUntil: ((p: Promise<unknown>) => void) | undefined
@@ -280,41 +305,192 @@ tvboxRouter.get("/config.json", async (c) => {
   if (denied) return denied
   const code = envValue(c, "TVBOX_ACCESS_CODE")
 
-  // sources 参数由管理页生成并附带服务端签名；签名无效时降级为「全部源」，
+  // 旧版 sources 参数与新版 sel 均由服务端签名，签名无效时降级为「全部源」，
   // 不会越权（源路径始终由服务端白名单决定，客户端无法提交路径）。
   const requested = (c.req.query("sources") || "").trim()
   const sig = c.req.query("sig") || ""
-  let selected = ""
-  if (requested) {
-    const expected = await hmac(c, requested)
+
+  // 新版订阅：sel = {n:[网盘id], s:[爬虫id]}，服务端签名
+  const selRaw = (c.req.query("sel") || "").trim()
+  let netdiskIds: string[] = []
+  let spiderIds: string[] = []
+  if (selRaw) {
+    const expected = await hmac(c, selRaw)
     if (expected && constantTimeEqual(sig, expected)) {
-      const available = await readSources(c)
-      const ids = requested.split(",").map((s) => s.trim()).filter(Boolean)
-      selected = ids.filter((id) => available.some((s) => s.id === id)).join(",")
+      try {
+        const parsed = JSON.parse(selRaw)
+        netdiskIds = Array.isArray(parsed?.n) ? parsed.n.map(String) : []
+        spiderIds = Array.isArray(parsed?.s) ? parsed.s.map(String) : []
+      } catch {}
     }
   }
 
-  const apiUrl = absoluteUrl(c, "/@tvbox/api")
-  const params: string[] = []
-  if (code) params.push(`code=${encodeURIComponent(code)}`)
-  if (selected) params.push(`sources=${encodeURIComponent(selected)}`)
-  const api = params.length ? `${apiUrl}?${params.join("&")}` : apiUrl
+  const cfg = await readConfig(c)
+  const sites: any[] = []
 
-  return c.json({
-    spider: "",
-    sites: [
-      {
-        key: "openlist",
-        name: "OpenList 网盘",
-        type: 3,
-        api,
-        searchable: 1,
-        filterable: 0,
-        changeable: 0,
-      },
-    ],
-    rules: {},
-  })
+  const apiUrl = absoluteUrl(c, "/@tvbox/api")
+  const netdiskParams: string[] = []
+  if (code) netdiskParams.push(`code=${encodeURIComponent(code)}`)
+  if (netdiskIds.length) {
+    const available = cfg.netdisk.map((s) => s.id)
+    netdiskParams.push(`sources=${encodeURIComponent(netdiskIds.filter((id) => available.includes(id)).join(","))}`)
+  }
+  const hasNetdisk = netdiskIds.length ? cfg.netdisk.some((s) => netdiskIds.includes(s.id)) : cfg.netdisk.length > 0
+  if (hasNetdisk) {
+    sites.push({
+      key: "omnibox_netdisk",
+      name: "OmniBox 网盘",
+      type: 3,
+      api: netdiskParams.length ? `${apiUrl}?${netdiskParams.join("&")}` : apiUrl,
+      searchable: 1,
+      filterable: 0,
+      changeable: 0,
+    })
+  }
+
+  const hasSpider = spiderIds.length
+    ? cfg.spiders.some((s) => s.enabled && spiderIds.includes(s.id))
+    : cfg.spiders.some((s) => s.enabled)
+  if (hasSpider) {
+    const spiderParams: string[] = []
+    if (code) spiderParams.push(`code=${encodeURIComponent(code)}`)
+    if (spiderIds.length) spiderParams.push(`spiders=${encodeURIComponent(spiderIds.join(","))}`)
+    const spiderApi = absoluteUrl(c, "/@tvbox/spider")
+    sites.push({
+      key: "omnibox_spider",
+      name: "OmniBox 爬虫源",
+      type: 3,
+      api: spiderParams.length ? `${spiderApi}?${spiderParams.join("&")}` : spiderApi,
+      searchable: 1,
+      filterable: 0,
+      changeable: 0,
+    })
+  }
+
+  // 兼容旧版 sources 参数（无 sel 时）
+  if (!selRaw && requested) {
+    const expected = await hmac(c, requested)
+    if (expected && constantTimeEqual(sig, expected)) {
+      const ids = requested.split(",").map((s) => s.trim()).filter(Boolean)
+      const selected = ids.filter((id) => cfg.netdisk.some((s) => s.id === id)).join(",")
+      if (selected) {
+        const params = netdiskParams.filter((p) => !p.startsWith("sources="))
+        params.push(`sources=${encodeURIComponent(selected)}`)
+        sites.length = 0
+        sites.push({
+          key: "openlist",
+          name: "OpenList 网盘",
+          type: 3,
+          api: `${apiUrl}?${params.join("&")}`,
+          searchable: 1,
+          filterable: 0,
+          changeable: 0,
+        })
+      }
+    }
+  }
+
+  if (!sites.length) {
+    sites.push({
+      key: "omnibox_netdisk",
+      name: "OmniBox 网盘",
+      type: 3,
+      api: netdiskParams.length ? `${apiUrl}?${netdiskParams.join("&")}` : apiUrl,
+      searchable: 1,
+      filterable: 0,
+      changeable: 0,
+    })
+  }
+
+  return c.json({ spider: "", sites, rules: {} })
+})
+
+tvboxRouter.get("/spider", async (c) => {
+  const denied = accessDenied(c)
+  if (denied) return denied
+
+  const cfg = await readConfig(c)
+  const selected = c.req.query("spiders")
+  let spiders = cfg.spiders.filter((s) => s.enabled)
+  if (selected) {
+    const ids = new Set(selected.split(",").map((s) => s.trim()).filter(Boolean))
+    spiders = spiders.filter((s) => ids.has(s.id))
+  }
+  const classes = spiders.map((s) => ({ type_id: s.id, type_name: s.name }))
+
+  const ac = c.req.query("ac") || "videolist"
+  const keyword = (c.req.query("wd") || "").trim()
+  const ids = c.req.query("ids") || ""
+  const typeId = c.req.query("t") || c.req.query("type") || spiders[0]?.id
+  const page = pageOf(c)
+  const limit = 60
+
+  if (ac === "list") {
+    return c.json({ class: classes, list: [], page: 1, pagecount: 1, limit: 0, total: 0 })
+  }
+
+  try {
+    let rows: any[] = []
+    if (ids.startsWith("spider:")) {
+      const parts = ids.split(":")
+      const sid = parts[1] || ""
+      const playId = b64urlDecode(parts[2] || "")
+      const sp = spiders.find((s) => s.id === sid)
+      if (!sp) return c.json({ code: 404, message: "spider not found", list: [] }, 404)
+      const detailRes = await runSpider(sp, "detail", { playId, id: playId }, { from: "detail" })
+      const playRes = await runSpider(sp, "play", { playId }, { from: "play" })
+      const base = detailRes.data?.list?.[0] || detailRes.data || {}
+      const playData = playRes.data || {}
+      const urls = Array.isArray(playData.urls) ? playData.urls : []
+      const playText = urls
+        .map((u: any) => `${u.name || "线路"}$${u.url || u.play_url || ""}`)
+        .join("#")
+      rows.push(
+        fromSpiderVod(
+          {
+            ...base,
+            vod_id: playId,
+            vod_play_from: playData.parse ? "OmniBox解析" : "OmniBox",
+            vod_play_url: playText,
+          },
+          sp.id,
+          sp.name,
+        ),
+      )
+    } else {
+      const targets = keyword || ac === "search"
+        ? spiders
+        : spiders.filter((s) => s.id === typeId)
+      for (const sp of targets) {
+        const method = keyword || ac === "search" ? "search" : typeId === sp.id && ac !== "videolist" ? "category" : "home"
+        const params =
+          method === "search"
+            ? { keyword, page }
+            : method === "category"
+              ? { categoryId: c.req.query("categoryId") || c.req.query("pg") || "1", page }
+              : { page }
+        const res = await runSpider(sp, method, params, { from: method })
+        if (!res.ok) {
+          console.warn(`[tvbox] spider ${sp.id}.${method} failed: ${res.error}`)
+          continue
+        }
+        const list = Array.isArray(res.data?.list) ? res.data.list : []
+        for (const v of list) rows.push(fromSpiderVod(v, sp.id, sp.name))
+      }
+    }
+
+    const total = rows.length
+    return c.json({
+      class: classes,
+      list: rows.slice((page - 1) * limit, page * limit),
+      page,
+      pagecount: Math.max(1, Math.ceil(total / limit)),
+      limit,
+      total,
+    })
+  } catch (e: any) {
+    return c.json({ code: 500, message: safeErrorMessage(e), class: classes, list: [] }, 500)
+  }
 })
 
 tvboxRouter.get("/api", async (c) => {

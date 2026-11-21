@@ -34,7 +34,7 @@ function absoluteUrl(c: any, path: string): string {
 
 type MountOption = { path: string; driver: string; remark: string }
 
-async function readMounts(c: any): Promise<MountOption[]> {
+export async function readMounts(c: any): Promise<MountOption[]> {
   try {
     const db = await getDb(c.env)
     return (db.storages || [])

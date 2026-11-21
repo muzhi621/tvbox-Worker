@@ -1,4 +1,6 @@
 import { getDb, saveDb } from "../internal/model/db"
+import { readConfig as readOmniConfig } from "./omnibox-store"
+export { readOmniConfig as readConfig }
 
 /**
  * TVBox 源配置存储层。
@@ -95,6 +97,10 @@ export function normalizeSources(raw: string): TvboxSource[] {
 export async function readSources(c: any): Promise<TvboxSource[]> {
   try {
     const db = await getDb(c.env)
+    // 优先读 OmniBox 统一配置
+    const omni = await readOmniConfig(c)
+    if (omni.netdisk.length) return omni.netdisk
+    // 兼容上一版独立 key
     const row = (db.settings || []).find((s: any) => s && s.key === SETTINGS_KEY)
     if (row && typeof row.value === "string" && row.value.trim()) {
       const stored = normalizeSources(row.value)

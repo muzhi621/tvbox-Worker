@@ -7,12 +7,10 @@ import {
   isCdnConfigured,
   cdnAssetRedirect,
 } from "./server/assets"
-import { webdavRouter } from "./server/webdav"
-import { s3Router } from "./server/s3"
 import { setEnvCtx } from "./internal/model/db"
-import { embyRouter, subsonicRouter } from "./server/emby"
 import { tvboxRouter } from "./server/tvbox"
 import { tvboxAdminRouter } from "./server/tvbox-admin"
+import { omniboxRouter } from "./server/omnibox"
 import { getStoreConfigErrorDetail } from "./internal/model/store/backend"
 import { storageErrorSummary, uiStorageError } from "./server/storage-error"
 
@@ -170,27 +168,18 @@ const api = new Hono()
 setupRouter(api)
 app.route("/api", api)
 
-// Mount specific short paths at root for better compatibility
-app.route("/d", rawRouter)
-app.route("/sd", rawRouter)
-app.route("/p", rawRouter)
-
-// 媒体库协议端点：/@emby 与 /@rest，避免与用户目录冲突
-app.route("/@emby", embyRouter)
-app.route("/@rest", subsonicRouter)
-
 // TVBox / CatVod 兼容端点，必须在 SPA 兜底之前挂载
 app.route("/@tvbox", tvboxRouter)
 app.route("/@tvbox", tvboxAdminRouter)
 
+// OmniBox 统一入口（概览 / 网盘 / 媒体库 / 爬虫 / 订阅）
+app.route("/@omnibox", omniboxRouter)
+
 // 内嵌品牌资源（logo/favicon），必须在 SPA 兜底 app.all("*") 之前挂载
 app.route("/", assetsRouter)
 
-// WebDAV 协议服务（/dav/*），必须在 SPA 兜底之前挂载
-app.route("/dav", webdavRouter)
-
-// S3 网关（/s3/*），必须在 SPA 兜底之前挂载
-app.route("/s3", s3Router)
+// WebDAV 与 S3 已移除：本项目只保留网盘→TVBox 转换链路。
+// 播放直链仍由 /api/d、/api/p 提供（见 router.ts），挂载 API 由 /api/admin 提供。
 
 // SPA 兜底 HTML（由 EdgeOne 入口 api/_makers.ts 在构建期注入 dist/index.html；
 // 其他平台入口不注入，保持原有 ASSETS / 404 行为）

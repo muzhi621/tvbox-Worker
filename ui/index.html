@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OmniBox Worker</title>
+<style>
+:root{color-scheme:light;--bg:#f5f6f8;--card:#fff;--line:#e3e6ec;--text:#1f2430;--muted:#6b7280;--brand:#2563eb;--brand-soft:#eff4ff;--danger:#dc2626;--ok:#16a34a}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
+.app{display:flex;min-height:100vh}
+.side{width:210px;background:#111827;color:#cbd5e1;padding:22px 14px;flex-shrink:0}
+.side h1{font-size:17px;color:#fff;margin:0 0 4px;padding:0 10px}
+.side .sub{font-size:11px;color:#64748b;padding:0 10px 18px}
+.nav button{display:block;width:100%;text-align:left;background:none;border:0;color:#cbd5e1;padding:10px 12px;border-radius:8px;margin:2px 0;font-size:14px;cursor:pointer}
+.nav button:hover{background:#1f2937}
+.nav button.on{background:var(--brand);color:#fff}
+.main{flex:1;padding:28px 34px;max-width:1100px}
+.page{display:none}
+.page.on{display:block}
+h2{font-size:19px;margin:0 0 6px}
+.desc{color:var(--muted);margin:0 0 20px;font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.grow{flex:1;min-width:160px}
+input,select,button,textarea{font:inherit;padding:8px 11px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--text)}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--brand-soft);border-color:var(--brand)}
+button{cursor:pointer}
+.btn{background:var(--brand);color:#fff;border-color:var(--brand)}
+.btn:hover{opacity:.9}
+.btn-ghost{background:#fff}
+.btn-danger{color:var(--danger);border-color:#fecaca;background:#fff}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px}
+.poster{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.poster img{width:100%;aspect-ratio:2/3;object-fit:cover;background:#eef1f6;display:block}
+.poster .t{padding:8px 10px;font-size:13px}
+.poster .m{padding:0 10px 10px;font-size:11px;color:var(--muted)}
+.item{display:flex;gap:12px;align-items:center;padding:12px;border:1px solid var(--line);border-radius:9px;margin-bottom:8px;background:#fff}
+.item .grow{min-width:0}
+.item .name{font-weight:600}
+.item .meta{font-size:12px;color:var(--muted);word-break:break-all}
+.tag{display:inline-block;font-size:11px;padding:1px 8px;border-radius:20px;background:var(--brand-soft);color:var(--brand);margin-left:6px}
+.tag.off{background:#f1f5f9;color:#64748b}
+.link{background:#0f172a;color:#93c5fd;padding:12px;border-radius:8px;font:12px/1.6 ui-monospace,Consolas,monospace;word-break:break-all}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+.stat .n{font-size:26px;font-weight:600}
+.stat .l{font-size:12px;color:var(--muted)}
+.msg{padding:10px 14px;border-radius:8px;margin-bottom:14px;display:none}
+.msg.ok{display:block;background:#dcfce7;color:#166534}
+.msg.err{display:block;background:#fee2e2;color:#991b1b}
+.msg.info{display:block;background:#dbeafe;color:#1e40af}
+code{background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
+textarea{width:100%;min-height:220px;font:12px/1.5 ui-monospace,Consolas,monospace}
+.loading{color:var(--muted);padding:20px;text-align:center}
+@media(max-width:760px){.side{width:100%;display:flex;flex-wrap:wrap;padding:12px}.side h1,.side .sub{width:100%}.nav{display:flex;flex-wrap:wrap}.nav button{width:auto}.main{padding:18px}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="side">
+<h1>OmniBox Worker</h1>
+<div class="sub">网盘 · 爬虫 · 媒体库 · 订阅</div>
+<nav class="nav">
+<button data-page="dash" class="on">概览</button>
+<button data-page="media">媒体库</button>
+<button data-page="mount">网盘挂载</button>
+<button data-page="netdisk">网盘源</button>
+<button data-page="spider">爬虫源</button>
+<button data-page="sub">订阅链接</button>
+</nav>
+</aside>
+<main class="main">
+<div id="msg" class="msg"></div>
+
+<section class="page on" id="page-dash">
+<h2>概览</h2>
+<p class="desc">当前部署的运行状态。所有数据来自服务端，网盘凭据不会出现在浏览器。</p>
+<div class="stats" id="stats"></div>
+<div class="card" style="margin-top:16px">
+<h3 style="margin:0 0 8px;font-size:14px">快速开始</h3>
+<ol style="margin:0;padding-left:20px;color:var(--muted)">
+<li>在「网盘挂载」添加 OpenList 存储（需先在 OpenList 后台建管理员）</li>
+<li>在「网盘源」把挂载目录登记为源；或在「爬虫源」导入 OmniBox JS 脚本</li>
+<li>在「媒体库」扫描目录并刮削海报（需 TMDB API Key）</li>
+<li>在「订阅链接」勾选需要的源，生成地址导入 TVBox</li>
+</ol>
+</div>
+</section>
+
+<section class="page" id="page-media">
+<h2>媒体库</h2>
+<p class="desc">扫描网盘目录生成媒体条目，刮削后显示海报。海报墙与 TVBox 目录浏览互不干扰。</p>
+<div class="card">
+<div class="row">
+<select id="mediaType"><option value="video">影视</option><option value="music">音乐</option><option value="image">图片</option><option value="book">书籍</option></select>
+<input id="mediaKey" class="grow" placeholder="搜索名称">
+<button class="btn" id="mediaSearch">搜索</button>
+<button class="btn-ghost" id="mediaScan">扫描</button>
+<button class="btn-ghost" id="mediaScrape">刮削海报</button>
+</div>
+<div class="row" style="margin-top:12px">
+<input id="tmdbKey" class="grow" placeholder="TMDB API Key（用于刮削海报）">
+<button class="btn-ghost" id="saveTmdb">保存 Key</button>
+</div>
+<div class="row" style="margin-top:12px">
+<select id="scanPath" class="grow"></select>
+<button class="btn-ghost" id="addScanPath">添加扫描路径</button>
+</div>
+</div>
+<div id="mediaGrid" class="grid"><div class="loading">加载中…</div></div>
+</section>
+
+<section class="page" id="page-mount">
+<h2>网盘挂载</h2>
+<p class="desc">这里显示 OpenList 已挂载的存储。新增挂载需在 OpenList 管理后台完成：打开站点根路径，登录后进入「存储 → 添加」。</p>
+<div class="card">
+<div class="row"><input id="openlistUrl" class="grow" readonly><button class="btn-ghost" id="copyOpenlist">复制后台地址</button></div>
+</div>
+<div id="mountList"></div>
+</section>
+
+<section class="page" id="page-netdisk">
+<h2>网盘源</h2>
+<p class="desc">把已挂载的网盘目录登记为 TVBox 可浏览的源。</p>
+<div class="card">
+<div class="row">
+<select id="ndMount" class="grow"></select>
+<input id="ndName" placeholder="显示名称">
+<button class="btn" id="ndAdd">添加源</button>
+</div>
+</div>
+<div id="ndList"></div>
+</section>
+
+<section class="page" id="page-spider">
+<h2>爬虫源</h2>
+<p class="desc">导入 OmniBox JS 爬虫脚本。注意：EdgeOne 无 Chromium，依赖嗅探的脚本播放能力受限。</p>
+<div class="card">
+<div class="row">
+<input id="spName" class="grow" placeholder="源名称">
+<input id="spId" placeholder="ID（英文数字）">
+<button class="btn" id="spSave">保存脚本</button>
+</div>
+<div style="margin-top:10px"><textarea id="spCode" placeholder="粘贴 OmniBox JS 脚本代码，需 module.exports = { home, category, detail, search, play }"></textarea></div>
+<div class="row" style="margin-top:10px">
+<button class="btn-ghost" id="spTest">测试 home()</button>
+<span class="muted" id="spTestMsg"></span>
+</div>
+</div>
+<div id="spList"></div>
+</section>
+
+<section class="page" id="page-sub">
+<h2>订阅链接</h2>
+<p class="desc">勾选要发布到 TVBox 的源，生成一条订阅地址。</p>
+<div class="card">
+<div id="subPick"></div>
+<div class="row" style="margin-top:14px"><button class="btn" id="subGen">生成订阅链接</button></div>
+<div id="subResult" style="display:none;margin-top:14px">
+<div class="link" id="subUrl"></div>
+<div class="row" style="margin-top:10px"><button class="btn-ghost" id="subCopy">复制链接</button></div>
+</div>
+</div>
+</section>
+</main>
+</div>
+
+<script>
+var code=new URLSearchParams(location.search).get('code')||'';
+var cfg={netdisk:[],spiders:[]},mounts=[];
+function q(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function msg(text,kind){var el=document.getElementById('msg');el.textContent=text;el.className='msg '+(kind||'info')}
+function api(path,opt){opt=opt||{};var url='/@omnibox'+path+(path.indexOf('?')<0?'?':'&')+'code='+encodeURIComponent(code);opt.headers=opt.headers||{};if(opt.body&&typeof opt.body!=='string'){opt.headers['Content-Type']='application/json';opt.body=JSON.stringify(opt.body)}return fetch(url,opt).then(function(r){return r.json().then(function(j){if(!r.ok||(j.code&&j.code!==200))throw new Error(j.message||('HTTP '+r.status));return j})})}
+function switchPage(name){document.querySelectorAll('.nav button').forEach(function(b){b.classList.toggle('on',b.getAttribute('data-page')===name)});document.querySelectorAll('.page').forEach(function(p){p.classList.toggle('on',p.id==='page-'+name)});if(name==='dash')loadDash();if(name==='media')loadMedia();if(name==='mount')loadMounts();if(name==='netdisk')loadNetdisk();if(name==='spider')loadSpiders();if(name==='sub')loadSub()}
+document.querySelectorAll('.nav button').forEach(function(b){b.onclick=function(){switchPage(b.getAttribute('data-page'))}});
+
+function loadDash(){api('/status').then(function(j){var d=j.data;document.getElementById('stats').innerHTML=[['网盘存储',d.mountCount],['网盘源',d.netdiskCount],['爬虫源',d.spiderCount],['媒体条目',d.mediaTotal],['已刮削',d.mediaScraped]].map(function(x){return '<div class="stat"><div class="n">'+x[1]+'</div><div class="l">'+x[0]+'</div></div>'}).join('')}).catch(function(e){msg(e.message,'err')})}
+function loadMounts(){document.getElementById('openlistUrl').value=location.origin+'/';api('/mounts').then(function(j){mounts=j.data||[];document.getElementById('mountList').innerHTML=mounts.length?mounts.map(function(m){return '<div class="item"><div class="grow"><div class="name">'+q(m.path)+'</div><div class="meta">'+q(m.driver)+(m.remark?' · '+q(m.remark):'')+'</div></div></div>'}).join(''):'<div class="card">暂无挂载。请先在 OpenList 后台添加存储。</div>';fillMountSelects()}).catch(function(e){msg(e.message,'err')})}
+function fillMountSelects(){['ndMount','scanPath'].forEach(function(id){var el=document.getElementById(id);if(!el)return;var cur=el.value;el.innerHTML=mounts.length?mounts.map(function(m){return '<option value="'+q(m.path)+'">'+q(m.path)+'</option>'}).join(''):'<option value="">（无挂载）</option>';if(cur)el.value=cur})}
+function loadNetdisk(){Promise.all([api('/sources'),api('/mounts')]).then(function(r){cfg=r[0].data;mounts=r[1].data||[];fillMountSelects();var list=cfg.netdisk||[];document.getElementById('ndList').innerHTML=list.length?list.map(function(s){return '<div class="item"><div class="grow"><div class="name">'+q(s.name)+'</div><div class="meta">'+q(s.path)+'</div></div><button class="btn-danger" data-nddel="'+q(s.id)+'">删除</button></div>'}).join(''):'<div class="card">暂无网盘源</div>';document.querySelectorAll('[data-nddel]').forEach(function(b){b.onclick=function(){cfg.netdisk=cfg.netdisk.filter(function(s){return s.id!==b.getAttribute('data-nddel')});api('/sources/netdisk',{method:'POST',body:{sources:cfg.netdisk}}).then(function(){msg('已删除','ok');loadNetdisk()}).catch(function(e){msg(e.message,'err')})}})}).catch(function(e){msg(e.message,'err')})}
+document.getElementById('ndAdd').onclick=function(){var path=document.getElementById('ndMount').value,name=document.getElementById('ndName').value.trim();if(!path){msg('请先挂载网盘','err');return}var base=path.replace(/^\/+|\/+$/g,'').split('/').pop()||'src';var id=base.replace(/[^A-Za-z0-9_-]/g,'_').slice(0,32);var n=1;while((cfg.netdisk||[]).some(function(s){return s.id===id})){id=base.replace(/[^A-Za-z0-9_-]/g,'_').slice(0,28)+'_'+(n++)}cfg.netdisk=cfg.netdisk.concat([{id:id,name:name||base,path:path}]);api('/sources/netdisk',{method:'POST',body:{sources:cfg.netdisk}}).then(function(){msg('已添加','ok');document.getElementById('ndName').value='';loadNetdisk()}).catch(function(e){msg(e.message,'err')})};
+
+function loadSpiders(){api('/sources').then(function(j){cfg=j.data;var list=cfg.spiders||[];document.getElementById('spList').innerHTML=list.length?list.map(function(s){return '<div class="item"><div class="grow"><div class="name">'+q(s.name)+' <span class="tag'+(s.enabled?'':' off')+'">'+(s.enabled?'启用':'停用')+'</span></div><div class="meta">id: '+q(s.id)+'</div></div><button class="btn-ghost" data-spload="'+q(s.id)+'">编辑</button> <button class="btn-danger" data-spdel="'+q(s.id)+'">删除</button></div>'}).join(''):'<div class="card">暂无爬虫源</div>';document.querySelectorAll('[data-spload]').forEach(function(b){b.onclick=function(){var s=list.find(function(x){return x.id===b.getAttribute('data-spload')});if(s)editSpider(s)}});document.querySelectorAll('[data-spdel]').forEach(function(b){b.onclick=function(){cfg.spiders=list.filter(function(x){return x.id!==b.getAttribute('data-spdel')});api('/sources/spiders',{method:'POST',body:{spiders:cfg.spiders}}).then(function(){msg('已删除','ok');loadSpiders()}).catch(function(e){msg(e.message,'err')})}})}).catch(function(e){msg(e.message,'err')})}
+function editSpider(s){document.getElementById('spName').value=s.name;document.getElementById('spId').value=s.id;document.getElementById('spCode').value=s.code}
+document.getElementById('spSave').onclick=function(){var name=document.getElementById('spName').value.trim(),id=document.getElementById('spId').value.trim(),script=document.getElementById('spCode').value;if(!name||!id||!script.trim()){msg('请填名称、ID 与脚本','err');return}var list=(cfg.spiders||[]).filter(function(s){return s.id!==id});list.push({id:id,name:name,code:script,enabled:true});api('/sources/spiders',{method:'POST',body:{spiders:list}}).then(function(){msg('已保存','ok');loadSpiders()}).catch(function(e){msg(e.message,'err')})};
+document.getElementById('spTest').onclick=function(){var script=document.getElementById('spCode').value;if(!script.trim()){msg('请先粘贴脚本','err');return}msg('测试中…','info');api('/spider/test',{method:'POST',body:{method:'home',code:script,params:{page:1}}}).then(function(j){var d=j.data.data;document.getElementById('spTestMsg').textContent=d.ok?('成功，返回 '+((d.data&&d.data.list||[]).length)+' 条，耗时 '+d.ms+'ms'):('失败：'+d.error)}).catch(function(e){document.getElementById('spTestMsg').textContent='失败：'+e.message})};
+
+function loadMedia(){api('/media').then(function(j){var list=j.data.list||[];document.getElementById('mediaGrid').innerHTML=list.length?list.map(function(m){return '<div class="poster">'+(m.cover?'<img src="'+q(m.cover)+'" loading="lazy">':'<img src="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22/%3E">')+'<div class="t">'+q(m.name)+'</div><div class="m">'+(m.year?q(m.year)+' · ':'')+(m.rating?('★ '+m.rating):'')+(m.scraped?'':' · 未刮削')+'</div></div>'}).join(''):'<div class="loading">暂无媒体条目，先添加扫描路径并扫描</div>'}).catch(function(e){msg(e.message,'err');document.getElementById('mediaGrid').innerHTML='<div class="loading">加载失败</div>'});api('/media/scan-paths').then(function(j){var paths=j.data||[];document.getElementById('scanPath').innerHTML=paths.length?paths.map(function(p){return '<option value="'+p.id+'">'+q(p.path)+'</option>'}).join(''):'<option value="">（无扫描路径）</option>'}).catch(function(){})}
+document.getElementById('mediaSearch').onclick=loadMedia;
+document.getElementById('mediaScan').onclick=function(){var type=document.getElementById('mediaType').value;var pid=Number(document.getElementById('scanPath').value||0);api('/media/scan',{method:'POST',body:{media_type:type,scan_path_id:pid}}).then(function(){msg('扫描已启动，稍后刷新','ok')}).catch(function(e){msg(e.message,'err')})};
+document.getElementById('mediaScrape').onclick=function(){var type=document.getElementById('mediaType').value;api('/media/scrape',{method:'POST',body:{media_type:type}}).then(function(){msg('刮削已启动，稍后刷新','ok')}).catch(function(e){msg(e.message,'err')})};
+document.getElementById('saveTmdb').onclick=function(){api('/media/tmdb-key',{method:'POST',body:{key:document.getElementById('tmdbKey').value.trim()}}).then(function(){msg('TMDB Key 已保存','ok')}).catch(function(e){msg(e.message,'err')})};
+document.getElementById('addScanPath').onclick=function(){var path=document.getElementById('ndMount').value||document.getElementById('scanPath').value;if(!path||!path.startsWith('/')){msg('请先选择网盘挂载路径','err');return}api('/media/scan-paths',{method:'POST',body:{path:path,media_type:document.getElementById('mediaType').value}}).then(function(){msg('扫描路径已添加','ok');loadMedia()}).catch(function(e){msg(e.message,'err')})};
+
+function loadSub(){api('/sources').then(function(j){cfg=j.data;var h='';(cfg.netdisk||[]).forEach(function(s){h+='<label class="item"><input type="checkbox" checked data-sub="n:'+q(s.id)+'"><div class="grow"><div class="name">'+q(s.name)+' <span class="tag">网盘</span></div></div></label>'});(cfg.spiders||[]).forEach(function(s){h+='<label class="item"><input type="checkbox" '+(s.enabled?'checked':'')+' data-sub="s:'+q(s.id)+'"><div class="grow"><div class="name">'+q(s.name)+' <span class="tag off">爬虫</span></div></div></label>'});document.getElementById('subPick').innerHTML=h||'<div class="card">暂无源</div>'}).catch(function(e){msg(e.message,'err')})}
+document.getElementById('subGen').onclick=function(){var netdisk=[],spiders=[];document.querySelectorAll('[data-sub]').forEach(function(x){if(!x.checked)return;var v=x.getAttribute('data-sub');if(v.indexOf('n:')===0)netdisk.push(v.slice(2));else spiders.push(v.slice(2))});api('/subscribe',{method:'POST',body:{netdisk:netdisk,spiders:spiders}}).then(function(j){document.getElementById('subUrl').textContent=j.data.url;document.getElementById('subResult').style.display='block';msg('链接已生成','ok')}).catch(function(e){msg(e.message,'err')})};
+document.getElementById('subCopy').onclick=function(){var t=document.getElementById('subUrl').textContent;if(navigator.clipboard)navigator.clipboard.writeText(t).then(function(){msg('已复制','ok')});else msg('请手动复制','info')};
+document.getElementById('copyOpenlist').onclick=function(){var t=document.getElementById('openlistUrl').value;if(navigator.clipboard)navigator.clipboard.writeText(t).then(function(){msg('已复制','ok')});else msg('请手动复制','info')};
+
+if(!code){msg('未检测到访问码。请用带 code 参数的完整地址打开本页，或从订阅管理入口进入。','err')}
+switchPage('dash');
+</script>
+</body>
+</html>
