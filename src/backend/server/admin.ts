@@ -197,7 +197,7 @@ export const normalizeDriver = (driverName: string): string => {
   return driverName || ""
 }
 
-const ensureStorageAdditionDeviceId = (
+export const ensureStorageAdditionDeviceId = (
   driverName: string,
   additionInput: any,
 ): string => {
@@ -707,7 +707,7 @@ const COMMON_FIELDS = [
   SEED_POLICY_FIELD,
 ]
 
-const driverConfigs: Record<string, any> = {
+export const driverConfigs: Record<string, any> = {
   AliyundriveOpen: {
     name: "AliyundriveOpen",
     default_mount_path: "/aliyundrive",

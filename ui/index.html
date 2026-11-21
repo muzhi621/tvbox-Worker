@@ -80,8 +80,8 @@ textarea{width:100%;min-height:220px;font:12px/1.5 ui-monospace,Consolas,monospa
 <div class="card" style="margin-top:16px">
 <h3 style="margin:0 0 8px;font-size:14px">快速开始</h3>
 <ol style="margin:0;padding-left:20px;color:var(--muted)">
-<li>在「网盘挂载」添加 OpenList 存储（需先在 OpenList 后台建管理员）</li>
-<li>在「网盘源」把挂载目录登记为源；或在「爬虫源」导入 OmniBox JS 脚本</li>
+<li>在「网盘挂载」选择驱动、填写登录信息，点“添加网盘并登记为源”</li>
+<li>需要更多源时，在「网盘源」登记其它目录，或在「爬虫源」导入 OmniBox JS 脚本</li>
 <li>在「媒体库」扫描目录并刮削海报（需 TMDB API Key）</li>
 <li>在「订阅链接」勾选需要的源，生成地址导入 TVBox</li>
 </ol>
@@ -113,9 +113,18 @@ textarea{width:100%;min-height:220px;font:12px/1.5 ui-monospace,Consolas,monospa
 
 <section class="page" id="page-mount">
 <h2>网盘挂载</h2>
-<p class="desc">这里显示 OpenList 已挂载的存储。新增挂载需在 OpenList 管理后台完成：打开站点根路径，登录后进入「存储 → 添加」。</p>
+<p class="desc">在这里直接添加网盘登录信息（复用 OpenList 驱动）。凭据只写入服务端，不会回显到浏览器。</p>
 <div class="card">
-<div class="row"><input id="openlistUrl" class="grow" readonly><button class="btn-ghost" id="copyOpenlist">复制后台地址</button></div>
+<div class="row">
+<select id="mountDriver" class="grow"></select>
+<input id="mountPath" placeholder="挂载路径，如 /alist">
+<input id="mountRemark" placeholder="备注（可选）">
+</div>
+<div id="mountFields" class="row" style="margin-top:12px"></div>
+<div class="row" style="margin-top:12px">
+<button class="btn" id="mountAdd">添加网盘并登记为源</button>
+<span class="muted" id="mountAddMsg"></span>
+</div>
 </div>
 <div id="mountList"></div>
 </section>
@@ -172,14 +181,20 @@ var cfg={netdisk:[],spiders:[]},mounts=[];
 function q(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function msg(text,kind){var el=document.getElementById('msg');el.textContent=text;el.className='msg '+(kind||'info')}
 function api(path,opt){opt=opt||{};var url='/@omnibox'+path+(path.indexOf('?')<0?'?':'&')+'code='+encodeURIComponent(code);opt.headers=opt.headers||{};if(opt.body&&typeof opt.body!=='string'){opt.headers['Content-Type']='application/json';opt.body=JSON.stringify(opt.body)}return fetch(url,opt).then(function(r){return r.json().then(function(j){if(!r.ok||(j.code&&j.code!==200))throw new Error(j.message||('HTTP '+r.status));return j})})}
-function switchPage(name){document.querySelectorAll('.nav button').forEach(function(b){b.classList.toggle('on',b.getAttribute('data-page')===name)});document.querySelectorAll('.page').forEach(function(p){p.classList.toggle('on',p.id==='page-'+name)});if(name==='dash')loadDash();if(name==='media')loadMedia();if(name==='mount')loadMounts();if(name==='netdisk')loadNetdisk();if(name==='spider')loadSpiders();if(name==='sub')loadSub()}
+function switchPage(name){document.querySelectorAll('.nav button').forEach(function(b){b.classList.toggle('on',b.getAttribute('data-page')===name)});document.querySelectorAll('.page').forEach(function(p){p.classList.toggle('on',p.id==='page-'+name)});if(name==='dash')loadDash();if(name==='media')loadMedia();if(name==='mount'){loadDrivers();loadMounts()}if(name==='netdisk')loadNetdisk();if(name==='spider')loadSpiders();if(name==='sub')loadSub()}
 document.querySelectorAll('.nav button').forEach(function(b){b.onclick=function(){switchPage(b.getAttribute('data-page'))}});
 
 function loadDash(){api('/status').then(function(j){var d=j.data;document.getElementById('stats').innerHTML=[['网盘存储',d.mountCount],['网盘源',d.netdiskCount],['爬虫源',d.spiderCount],['媒体条目',d.mediaTotal],['已刮削',d.mediaScraped]].map(function(x){return '<div class="stat"><div class="n">'+x[1]+'</div><div class="l">'+x[0]+'</div></div>'}).join('')}).catch(function(e){msg(e.message,'err')})}
-function loadMounts(){document.getElementById('openlistUrl').value=location.origin+'/';api('/mounts').then(function(j){mounts=j.data||[];document.getElementById('mountList').innerHTML=mounts.length?mounts.map(function(m){return '<div class="item"><div class="grow"><div class="name">'+q(m.path)+'</div><div class="meta">'+q(m.driver)+(m.remark?' · '+q(m.remark):'')+'</div></div></div>'}).join(''):'<div class="card">暂无挂载。请先在 OpenList 后台添加存储。</div>';fillMountSelects()}).catch(function(e){msg(e.message,'err')})}
+function loadMounts(){api('/mounts').then(function(j){mounts=j.data||[];document.getElementById('mountList').innerHTML=mounts.length?mounts.map(function(m){return '<div class="item"><div class="grow"><div class="name">'+q(m.path)+'</div><div class="meta">'+q(m.driver)+(m.remark?' · '+q(m.remark):'')+'</div></div></div>'}).join(''):'<div class="card">暂无挂载。选择驱动并填写登录信息即可添加。</div>';fillMountSelects()}).catch(function(e){msg(e.message,'err')})}
 function fillMountSelects(){['ndMount','scanPath'].forEach(function(id){var el=document.getElementById(id);if(!el)return;var cur=el.value;el.innerHTML=mounts.length?mounts.map(function(m){return '<option value="'+q(m.path)+'">'+q(m.path)+'</option>'}).join(''):'<option value="">（无挂载）</option>';if(cur)el.value=cur})}
+var driverDefs=[];
+function loadDrivers(){return api('/driver-configs').then(function(j){driverDefs=j.data||[];var sel=document.getElementById('mountDriver');sel.innerHTML=driverDefs.map(function(d){return '<option value="'+q(d.name)+'">'+q(d.label||d.name)+'</option>'}).join('');renderDriverFields()}).catch(function(e){msg(e.message,'err')})}
+function renderDriverFields(){var d=driverDefs.find(function(x){return x.name===document.getElementById('mountDriver').value});var box=document.getElementById('mountFields');if(!d||!d.fields.length){box.innerHTML='<span class="muted">该驱动无需额外参数</span>';return}box.innerHTML=d.fields.map(function(f){var label=q(f.name)+(f.required?' *':'');var input;if(f.options&&f.options.length){input='<select data-field="'+q(f.name)+'">'+f.options.map(function(o){return '<option value="'+q(o)+'"'+(o===f.default?' selected':'')+'>'+q(o)+'</option>'}).join('')+'</select>'}else{var sensitive=/token|password|secret|key/i.test(f.name);input='<input data-field="'+q(f.name)+'" type="'+(sensitive?'password':'text')+'" placeholder="'+label+'" value="'+q(f.default||'')+'">'}return '<label style="display:flex;flex-direction:column;gap:4px;min-width:180px"><span class="muted">'+label+'</span>'+input+'</label>'}).join('')}
+document.getElementById('mountDriver').onchange=function(){renderDriverFields();var d=driverDefs.find(function(x){return x.name===document.getElementById('mountDriver').value});if(d&&d.default_mount_path)document.getElementById('mountPath').value=d.default_mount_path};
+function registerNetdiskSource(path,name){return api('/sources').then(function(j){var all=j.data||{};var list=(all.netdisk||[]).slice();var base=path.replace(/^\/+|\/+$/g,'').split('/').pop()||'src';var stem=base.replace(/[^A-Za-z0-9_-]/g,'_').slice(0,28);var id=stem,n=1;while(list.some(function(s){return s.id===id})){id=stem+'_'+(n++)}list.push({id:id,name:name||base,path:path});return api('/sources/netdisk',{method:'POST',body:{sources:list}})})}
 function loadNetdisk(){Promise.all([api('/sources'),api('/mounts')]).then(function(r){cfg=r[0].data;mounts=r[1].data||[];fillMountSelects();var list=cfg.netdisk||[];document.getElementById('ndList').innerHTML=list.length?list.map(function(s){return '<div class="item"><div class="grow"><div class="name">'+q(s.name)+'</div><div class="meta">'+q(s.path)+'</div></div><button class="btn-danger" data-nddel="'+q(s.id)+'">删除</button></div>'}).join(''):'<div class="card">暂无网盘源</div>';document.querySelectorAll('[data-nddel]').forEach(function(b){b.onclick=function(){cfg.netdisk=cfg.netdisk.filter(function(s){return s.id!==b.getAttribute('data-nddel')});api('/sources/netdisk',{method:'POST',body:{sources:cfg.netdisk}}).then(function(){msg('已删除','ok');loadNetdisk()}).catch(function(e){msg(e.message,'err')})}})}).catch(function(e){msg(e.message,'err')})}
-document.getElementById('ndAdd').onclick=function(){var path=document.getElementById('ndMount').value,name=document.getElementById('ndName').value.trim();if(!path){msg('请先挂载网盘','err');return}var base=path.replace(/^\/+|\/+$/g,'').split('/').pop()||'src';var id=base.replace(/[^A-Za-z0-9_-]/g,'_').slice(0,32);var n=1;while((cfg.netdisk||[]).some(function(s){return s.id===id})){id=base.replace(/[^A-Za-z0-9_-]/g,'_').slice(0,28)+'_'+(n++)}cfg.netdisk=cfg.netdisk.concat([{id:id,name:name||base,path:path}]);api('/sources/netdisk',{method:'POST',body:{sources:cfg.netdisk}}).then(function(){msg('已添加','ok');document.getElementById('ndName').value='';loadNetdisk()}).catch(function(e){msg(e.message,'err')})};
+document.getElementById('ndAdd').onclick=function(){var path=document.getElementById('ndMount').value,name=document.getElementById('ndName').value.trim();if(!path){msg('请先挂载网盘','err');return}registerNetdiskSource(path,name).then(function(){msg('已添加','ok');document.getElementById('ndName').value='';loadNetdisk()}).catch(function(e){msg(e.message,'err')})};
+document.getElementById('mountAdd').onclick=function(){var d=driverDefs.find(function(x){return x.name===document.getElementById('mountDriver').value});if(!d){msg('请先选择网盘驱动','err');return}var path=document.getElementById('mountPath').value.trim()||d.default_mount_path;if(path.charAt(0)!=='/'){msg('请填写挂载路径，如 /alist','err');return}var addition={};document.querySelectorAll('#mountFields [data-field]').forEach(function(el){addition[el.getAttribute('data-field')]=el.value});var remark=document.getElementById('mountRemark').value.trim();var tip=document.getElementById('mountAddMsg');tip.textContent='正在连接网盘…';api('/mounts/add',{method:'POST',body:{driver:d.name,mount_path:path,remark:remark,addition:addition}}).then(function(){tip.textContent='';msg('网盘已连接，正在登记为源…','ok');return registerNetdiskSource(path,remark||path)}).then(function(){msg('网盘已挂载并登记为网盘源','ok');document.getElementById('mountRemark').value='';loadMounts();loadDash()}).catch(function(e){tip.textContent='';msg(e.message,'err')})};
 
 function loadSpiders(){api('/sources').then(function(j){cfg=j.data;var list=cfg.spiders||[];document.getElementById('spList').innerHTML=list.length?list.map(function(s){return '<div class="item"><div class="grow"><div class="name">'+q(s.name)+' <span class="tag'+(s.enabled?'':' off')+'">'+(s.enabled?'启用':'停用')+'</span></div><div class="meta">id: '+q(s.id)+'</div></div><button class="btn-ghost" data-spload="'+q(s.id)+'">编辑</button> <button class="btn-danger" data-spdel="'+q(s.id)+'">删除</button></div>'}).join(''):'<div class="card">暂无爬虫源</div>';document.querySelectorAll('[data-spload]').forEach(function(b){b.onclick=function(){var s=list.find(function(x){return x.id===b.getAttribute('data-spload')});if(s)editSpider(s)}});document.querySelectorAll('[data-spdel]').forEach(function(b){b.onclick=function(){cfg.spiders=list.filter(function(x){return x.id!==b.getAttribute('data-spdel')});api('/sources/spiders',{method:'POST',body:{spiders:cfg.spiders}}).then(function(){msg('已删除','ok');loadSpiders()}).catch(function(e){msg(e.message,'err')})}})}).catch(function(e){msg(e.message,'err')})}
 function editSpider(s){document.getElementById('spName').value=s.name;document.getElementById('spId').value=s.id;document.getElementById('spCode').value=s.code}
@@ -196,8 +211,6 @@ document.getElementById('addScanPath').onclick=function(){var path=document.getE
 function loadSub(){api('/sources').then(function(j){cfg=j.data;var h='';(cfg.netdisk||[]).forEach(function(s){h+='<label class="item"><input type="checkbox" checked data-sub="n:'+q(s.id)+'"><div class="grow"><div class="name">'+q(s.name)+' <span class="tag">网盘</span></div></div></label>'});(cfg.spiders||[]).forEach(function(s){h+='<label class="item"><input type="checkbox" '+(s.enabled?'checked':'')+' data-sub="s:'+q(s.id)+'"><div class="grow"><div class="name">'+q(s.name)+' <span class="tag off">爬虫</span></div></div></label>'});document.getElementById('subPick').innerHTML=h||'<div class="card">暂无源</div>'}).catch(function(e){msg(e.message,'err')})}
 document.getElementById('subGen').onclick=function(){var netdisk=[],spiders=[];document.querySelectorAll('[data-sub]').forEach(function(x){if(!x.checked)return;var v=x.getAttribute('data-sub');if(v.indexOf('n:')===0)netdisk.push(v.slice(2));else spiders.push(v.slice(2))});api('/subscribe',{method:'POST',body:{netdisk:netdisk,spiders:spiders}}).then(function(j){document.getElementById('subUrl').textContent=j.data.url;document.getElementById('subResult').style.display='block';msg('链接已生成','ok')}).catch(function(e){msg(e.message,'err')})};
 document.getElementById('subCopy').onclick=function(){var t=document.getElementById('subUrl').textContent;if(navigator.clipboard)navigator.clipboard.writeText(t).then(function(){msg('已复制','ok')});else msg('请手动复制','info')};
-document.getElementById('copyOpenlist').onclick=function(){var t=document.getElementById('openlistUrl').value;if(navigator.clipboard)navigator.clipboard.writeText(t).then(function(){msg('已复制','ok')});else msg('请手动复制','info')};
-
 if(!code){msg('未检测到访问码。请用带 code 参数的完整地址打开本页，或从订阅管理入口进入。','err')}
 switchPage('dash');
 </script>

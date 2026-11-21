@@ -1,5 +1,11 @@
 import { Hono } from "hono"
-import { getDb } from "../internal/model/db"
+import { getDb, saveDb } from "../internal/model/db"
+import { getDriver } from "../internal/op/storage"
+import {
+  driverConfigs,
+  ensureStorageAdditionDeviceId,
+  normalizeDriver,
+} from "./admin"
 import {
   getMediaDb,
   queryItems,
@@ -67,6 +73,130 @@ omniboxRouter.get("/status", async (c) => {
 
 omniboxRouter.get("/mounts", async (c) => {
   return c.json({ code: 200, data: await readMounts(c) })
+})
+
+/**
+ * 驱动表单元数据：让 OmniBox 单页直接完成「添加网盘登录」，
+ * 不必跳到 OpenList 后台。只暴露字段名/类型/选项/默认值，
+ * 不返回任何已保存的凭据（addition 永不回传浏览器）。
+ */
+omniboxRouter.get("/driver-configs", async (c) => {
+  const list = Object.entries(driverConfigs).map(([name, cfg]: any) => ({
+    name,
+    label: String(cfg?.name || name),
+    default_mount_path: String(cfg?.default_mount_path || ""),
+    fields: (Array.isArray(cfg?.additional) ? cfg.additional : [])
+      .filter((f: any) => f && f.name)
+      .map((f: any) => ({
+        name: String(f.name),
+        type: String(f.type || "string"),
+        options: f.options
+          ? String(f.options)
+              .split(",")
+              .map((x: string) => x.trim())
+              .filter(Boolean)
+          : [],
+        default: f.default === undefined ? "" : f.default,
+        required: !!f.required,
+        help: f.help === true || f.help === "true",
+      })),
+  }))
+  return c.json({ code: 200, data: list })
+})
+
+/**
+ * 在同页新增 OpenList 存储。逻辑对齐 /api/admin/storage/create，
+ * 但鉴权由 /@omnibox 的访问码承担，用户无需再登录 OpenList 后台。
+ * 注意：返回数据绝不包含 addition（网盘 token / 密码）。
+ */
+omniboxRouter.post("/mounts/add", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const driver = normalizeDriver(String(body.driver || "").trim())
+  if (!driverConfigs[driver]) {
+    return c.json({ code: 400, message: "不支持的网盘驱动" }, 400)
+  }
+
+  let rawMount = String(body.mount_path || "").trim()
+  if (!rawMount) rawMount = String(driverConfigs[driver].default_mount_path || "")
+  const mountPath = "/" + rawMount.split("/").filter(Boolean).join("/")
+  if (mountPath === "/" || mountPath.includes("..")) {
+    return c.json({ code: 400, message: "挂载路径无效，请填写子目录（如 /alist）" }, 400)
+  }
+  const normalizedPath = (p: string) =>
+    "/" + String(p || "").split("/").filter(Boolean).join("/")
+  const db = await getDb(c.env)
+  if (
+    (db.storages || []).some(
+      (s: any) => !s.disabled && normalizedPath(s.mount_path) === mountPath,
+    )
+  ) {
+    return c.json({ code: 409, message: `挂载路径已存在：${mountPath}` }, 409)
+  }
+
+  const addition: Record<string, string> = {}
+  for (const f of driverConfigs[driver].additional || []) {
+    if (f && f.name && f.default !== undefined) {
+      addition[String(f.name)] = String(f.default)
+    }
+  }
+  const supplied = body.addition && typeof body.addition === "object" ? body.addition : {}
+  for (const [k, v] of Object.entries(supplied)) {
+    if (typeof k === "string" && k.length <= 128 && typeof v === "string" && v.length <= 4096) {
+      addition[k] = v
+    }
+  }
+  const missing = (driverConfigs[driver].additional || [])
+    .filter((f: any) => f && f.required && !String(addition[String(f.name)] || "").trim())
+    .map((f: any) => String(f.name))
+  if (missing.length) {
+    return c.json({ code: 400, message: `请填写：${missing.join("、")}` }, 400)
+  }
+
+  const newStorage: any = {
+    driver,
+    mount_path: mountPath,
+    remark: String(body.remark || "").slice(0, 200),
+    addition: ensureStorageAdditionDeviceId(driver, addition),
+    status: "work",
+    modified: new Date().toISOString(),
+    disabled: false,
+    id: (db.storages || []).length
+      ? Math.max(...(db.storages || []).map((s: any) => Number(s.id) || 0)) + 1
+      : 1,
+  }
+  ;(db.storages || (db.storages = [])).push(newStorage)
+  try {
+    await saveDb(db, c.env)
+  } catch (e: any) {
+    db.storages.pop()
+    return c.json({ code: 500, message: `保存失败：${e?.message || e}` }, 500)
+  }
+
+  let connectError = ""
+  try {
+    await getDriver(driver, newStorage)
+  } catch (e: any) {
+    connectError = e?.message || String(e)
+    newStorage.status = connectError
+    if (connectError.includes("unsupported driver")) newStorage.disabled = true
+    try {
+      await saveDb(db, c.env)
+    } catch {}
+  }
+  return c.json(
+    {
+      code: connectError ? 500 : 200,
+      message: connectError || "success",
+      data: {
+        id: newStorage.id,
+        driver,
+        mount_path: mountPath,
+        remark: newStorage.remark,
+        status: newStorage.status,
+      },
+    },
+    connectError ? 500 : 200,
+  )
 })
 
 // ---------- 媒体库 ----------

@@ -42,7 +42,7 @@ TVBox  ──▶ /@tvbox/config.json ──▶ 订阅配置（网盘站 + 爬虫
 ## 功能模块
 
 1. **概览**：网盘数、源数量、媒体条目与刮削状态
-2. **网盘挂载**：复用 OpenList 驱动（115/123/阿里云盘/PikPak/夸克等分享驱动），在 OpenList 后台完成挂载
+2. **网盘挂载**：复用 OpenList 驱动（115/123/阿里云盘/PikPak/夸克等分享驱动），直接在 OmniBox 管理页添加并登记为源
 3. **网盘源**：把已挂载目录登记为 TVBox 可浏览的源
 4. **爬虫源**：导入 OmniBox JS 脚本（`module.exports = { home, category, detail, search, play }`），沙箱内执行
 5. **媒体库**：扫描网盘目录，TMDB 刮削海报，海报墙展示；TVBox 目录浏览不受影响
@@ -93,14 +93,15 @@ DB_CIPHER=aes-256-gcm
 | 输出目录 | `dist` |
 | Node 版本 | 22.x |
 
-部署后打开 `https://你的域名/@omnibox/?code=你的访问码` 进入管理界面（根路径 `/` 是 OpenList 后台，用于挂载网盘）。
+部署后打开 `https://你的域名/@omnibox/?code=你的访问码` 进入管理界面，添加网盘、导入源、发布订阅都在这一页完成（根路径 `/` 保留 OpenList 后台供高级配置）。
 
 ## 接口
 
 | 路径 | 说明 |
 |---|---|
 | `GET /@omnibox/?code=xxx` | OmniBox 单页管理界面 |
-| `GET /@omnibox/status\|mounts\|sources\|media?code=xxx` | 数据与状态查询 |
+| `GET /@omnibox/driver-configs\|mounts\|sources\|media?code=xxx` | 驱动表单与数据查询 |
+| `POST /@omnibox/mounts/add?code=xxx` | 在同一页添加网盘挂载（并登记为源） |
 | `POST /@omnibox/sources/netdisk\|spiders?code=xxx` | 保存源 |
 | `POST /@omnibox/media/scan\|scrape\|tmdb-key?code=xxx` | 媒体库操作 |
 | `POST /@omnibox/spider/test\|call?code=xxx` | 爬虫调试 |
