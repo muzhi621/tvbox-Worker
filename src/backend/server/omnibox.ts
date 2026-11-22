@@ -345,6 +345,12 @@ omniboxRouter.post("/media/tmdb-key", async (c) => {
 
 omniboxRouter.get("/sources", async (c) => {
   const cfg = await readConfig(c)
+  // lite 模式：去掉体积最大的 code 字段（爬虫脚本可达数 MB），
+  // 列表页只需元数据；代码通过 /spider/code?id= 按需单独读取。
+  if (c.req.query("lite") === "1") {
+    const spiders = (cfg.spiders || []).map(({ code: _code, ...rest }: any) => rest)
+    return c.json({ code: 200, data: { ...cfg, spiders } })
+  }
   return c.json({ code: 200, data: cfg })
 })
 
@@ -407,6 +413,71 @@ omniboxRouter.post("/sources/spiders", async (c) => {
   cfg.spiders = list
   await saveConfig(c, cfg)
   return c.json({ code: 200, data: { spiders: list.map((s) => ({ ...s, code: undefined })) } })
+})
+
+/**
+ * 单源局部更新：服务端读取完整配置后只改指定源，前端无需持有 code。
+ * 这样列表页可用 /sources?lite=1（不下载数 MB 脚本），且任何开关/编辑/删除
+ * 都不会因缺失 code 而误删其他源。
+ */
+omniboxRouter.post("/sources/spider/patch", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const id = String(body.id || "").trim()
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
+    return c.json({ code: 400, message: "invalid spider id" }, 400)
+  }
+  const cfg = await readConfig(c)
+  const list = cfg.spiders || []
+  const idx = list.findIndex((s: any) => s && s.id === id)
+
+  if (body.delete === true) {
+    if (idx >= 0) list.splice(idx, 1)
+  } else {
+    const patch: any = body.patch && typeof body.patch === "object" ? body.patch : {}
+    const code = String(body.code || "").trim()
+    if (idx >= 0) {
+      const cur: any = list[idx]
+      const next: any = { ...cur }
+      for (const k of ["name", "doc", "type", "category", "version", "author", "sourceRepo", "path", "updatedAt"]) {
+        if (patch[k] !== undefined) next[k] = String(patch[k]).slice(0, k === "doc" ? 4000 : 240)
+      }
+      for (const k of ["enabled", "nav", "push"]) {
+        if (patch[k] !== undefined) next[k] = !!patch[k]
+      }
+      if (patch.priority !== undefined) next.priority = Number.isFinite(Number(patch.priority)) ? Number(patch.priority) : 50
+      if (Array.isArray(patch.tags)) next.tags = patch.tags.map((t: any) => String(t).slice(0, 24)).slice(0, 6)
+      if (code) next.code = code
+      if (!next.code || !next.code.trim()) {
+        return c.json({ code: 400, message: "spider code is required" }, 400)
+      }
+      next.id = id
+      list[idx] = next
+    } else {
+      if (!code) return c.json({ code: 404, message: "spider not found" }, 404)
+      list.push({
+        id,
+        name: String(patch.name || id).slice(0, 80),
+        code,
+        doc: String(patch.doc || "").slice(0, 4000),
+        enabled: patch.enabled !== false,
+        type: patch.type === "Python" ? "Python" : "JavaScript",
+        category: String(patch.category || "").slice(0, 40),
+        priority: Number.isFinite(Number(patch.priority)) ? Number(patch.priority) : 50,
+        tags: Array.isArray(patch.tags) ? patch.tags.map((t: any) => String(t).slice(0, 24)).slice(0, 6) : [],
+        version: String(patch.version || "").slice(0, 40),
+        author: String(patch.author || "").slice(0, 60),
+        sourceRepo: String(patch.sourceRepo || "").slice(0, 120),
+        path: String(patch.path || "").slice(0, 240),
+        updatedAt: new Date().toISOString(),
+        nav: !!patch.nav,
+        push: !!patch.push,
+      })
+    }
+  }
+  cfg.spiders = list
+  await saveConfig(c, cfg)
+  const safe = (cfg.spiders || []).map((s: any) => ({ ...s, code: undefined }))
+  return c.json({ code: 200, data: { spiders: safe } })
 })
 
 // ---------- 爬虫调试 ----------
