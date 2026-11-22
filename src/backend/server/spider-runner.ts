@@ -276,26 +276,68 @@ function cheerioShim() {
 }
 
 function sdkShim(ctx: { fetch: typeof fetch; log: (...a: any[]) => void }) {
-  return {
-    log: (...args: any[]) => ctx.log(...args),
-    request: async (options: any) => {
-      const url = typeof options === "string" ? options : options?.url || options?.uri
+  // 进程内缓存，TTL 秒；够跑完一次请求链，不追求跨实例一致
+  const cache = new Map<string, { v: string; exp: number }>()
+  const sdk: any = {
+    log: (level: any, ...args: any[]) => {
+      const isLevel = typeof level === "string" && /^(info|warn|error|debug)$/i.test(level)
+      if (isLevel) ctx.log(`[${level}]`, ...args)
+      else ctx.log(level, ...args)
+    },
+    /**
+     * 真实 OmniBox SDK：request(url, options)，返回 { statusCode, body(string), headers }。
+     * 同时兼容 request({ url, ...options }) 的旧写法。
+     *
+     * 关键：body 必须是字符串（脚本普遍写 JSON.parse(res.body)）；statusCode 必须是数字
+     * （脚本写 Number(res.statusCode) !== 200）；两个参数都要收（headers 在第二个）。
+     */
+    request: async (input: any, options: any = {}) => {
+      const isStr = typeof input === "string"
+      const opts: any = isStr ? options || {} : { ...(input || {}), ...(options || {}) }
+      // 字符串首参就是 url；对象首参才从 url/uri 取
+      const url = isStr ? String(input) : String(opts.url || opts.uri || "")
       if (!url) throw new Error("request: missing url")
-      const method = String(options?.method || "GET").toUpperCase()
-      const headers = options?.headers || {}
-      const init: RequestInit = { method, headers }
-      if (options?.body !== undefined) {
-        init.body = typeof options.body === "string" ? options.body : JSON.stringify(options.body)
+
+      const method = String(opts.method || "GET").toUpperCase()
+      const init: RequestInit = { method, headers: opts.headers || {} }
+      const payload = opts.body ?? opts.data
+      if (payload !== undefined && method !== "GET" && method !== "HEAD") {
+        init.body = typeof payload === "string" ? payload : JSON.stringify(payload)
       }
+
       const res = await ctx.fetch(url, init)
       const text = await res.text()
-      let data: any = text
-      try {
-        data = JSON.parse(text)
-      } catch {}
-      return { data, status: res.status, headers: Object.fromEntries(res.headers.entries()) }
+      return {
+        statusCode: res.status,
+        status: res.status, // 兼容旧写法
+        headers: Object.fromEntries(res.headers.entries()),
+        body: text, // 必须字符串
+        data: text, // 兼容旧写法
+      }
     },
     fetch: ctx.fetch,
+    // ---- 缓存方法（OmniBox 2.x 脚本常用；缺了会 is not a function）----
+    getCache: async (key: string) => {
+      const hit = cache.get(String(key))
+      if (!hit) return ""
+      if (hit.exp && hit.exp < Date.now()) {
+        cache.delete(String(key))
+        return ""
+      }
+      return hit.v
+    },
+    setCache: async (key: string, value: any, ttlSeconds = 0) => {
+      if (cache.size > 500) cache.clear() // 防脚本把内存撑爆
+      cache.set(String(key), {
+        v: String(value ?? ""),
+        exp: ttlSeconds > 0 ? Date.now() + ttlSeconds * 1000 : 0,
+      })
+      return true
+    },
+    delCache: async (key: string) => cache.delete(String(key)),
+    getDanmakuByFileName: async () => [],
+    getScrapeMetadata: async () => null,
+    processScraping: async () => null,
     // 需要 Chromium / 后端状态的能力，明确降级为空，避免脚本误判成功
     sniffVideo: async () => null,
     getEnv: (key: string) => process.env?.[key] || "",
@@ -307,6 +349,7 @@ function sdkShim(ctx: { fetch: typeof fetch; log: (...a: any[]) => void }) {
     history: async () => [],
     saveHistory: async () => {},
   }
+  return sdk
 }
 
 export type RunResult = { ok: boolean; data?: any; error?: string; ms: number }
@@ -324,6 +367,18 @@ export async function runSpider(
   }
   if (!/^(home|category|detail|search|play)$/.test(method)) {
     return { ok: false, error: "invalid method", ms: 0 }
+  }
+
+  // Python 脚本：node:vm 只能跑 JS。明确报错优于抛一个莫名的 SyntaxError。
+  if (String((source as any).type || "") === "Python") {
+    return { ok: false, error: "该源是 Python 脚本，当前运行时只支持 JavaScript", ms: 0 }
+  }
+  const head = source.code.slice(0, 2000)
+  const looksPython =
+    /^\s*(#.*coding[:=].*\n)?\s*(import\s+\w+|from\s+\w+\s+import|def\s+\w+\s*\()/m.test(head) &&
+    !/\b(function|const|let|var|module\.exports)\b/.test(head)
+  if (looksPython) {
+    return { ok: false, error: "该源是 Python 脚本，当前运行时只支持 JavaScript", ms: 0 }
   }
 
   let moduleExport: SpiderModule = {}
@@ -364,15 +419,33 @@ export async function runSpider(
       }
     }
     if (name === "axios") {
+      // 脚本按真实 axios 写：res.data 是解析后的对象、res.status 是数字
+      const asJson = (text: string) => {
+        try {
+          return JSON.parse(text)
+        } catch {
+          return text
+        }
+      }
+      const wrap = (r: any) => ({
+        status: r.statusCode,
+        statusText: "",
+        headers: r.headers,
+        data: asJson(r.body),
+      })
+      const get = async (url: string, cfg: any = {}) =>
+        wrap(await sdk.request(url, { ...cfg, method: "GET" }))
+      const post = async (url: string, body: any, cfg: any = {}) =>
+        wrap(await sdk.request(url, { ...cfg, method: "POST", body }))
       return {
         create: () => ({
-          get: async (url: string, cfg: any) => sdk.request({ url, method: "GET", ...cfg }),
-          post: async (url: string, body: any, cfg: any) =>
-            sdk.request({ url, method: "POST", body, ...cfg }),
+          get,
+          post,
+          request: async (cfg: any) => wrap(await sdk.request(cfg.url, cfg)),
         }),
-        get: async (url: string, cfg: any) => sdk.request({ url, method: "GET", ...cfg }),
-        post: async (url: string, body: any, cfg: any) =>
-          sdk.request({ url, method: "POST", body, ...cfg }),
+        get,
+        post,
+        request: async (cfg: any) => wrap(await sdk.request(cfg.url, cfg)),
       }
     }
     if (name === "https") return { Agent: class {} }
@@ -434,8 +507,17 @@ export async function runSpider(
         ms: Date.now() - started,
       }
     }
+    // 脚本里 context.from 的语义是「客户端类型」（tvbox/sutv…），不是方法名。
+    // 按客户端分支的脚本若收到 from:"home" 会走错路径。
+    const scriptCtx = {
+      ...(context || {}),
+      from: "tvbox",
+      sourceId: source.id,
+      env: context?.env,
+      headers: context?.headers || {},
+    }
     const data = await Promise.race([
-      Promise.resolve((fn as any)(params || {}, context || { from: method })),
+      Promise.resolve((fn as any)(params || {}, scriptCtx)),
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error("script timeout")), timeoutMs),
       ),

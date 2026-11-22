@@ -64,9 +64,51 @@ const SUB_EXT = new Set(["srt", "ass", "ssa", "vtt", "sub"])
 type SpiderRef = { id: string; name: string; code: string }
 
 /** OmniBox 脚本返回的视频对象 → MACCMS 字段 */
-function fromSpiderVod(v: any, spiderId: string, spiderName: string): any {
+/**
+ * OmniBox 2.x 的 vod_play_sources → 苹果CMS 的 vod_play_from / vod_play_url。
+ *
+ * 每集地址必须是 http(s)：SUTV 的选集解析只接受 URL，裸 playId 会被丢弃。
+ * 因此统一换成 /@tvbox/play 跳转地址（playHref 负责生成本源绝对地址）。
+ * 线路分隔 $$$、集分隔 #、集名与地址分隔 $，三者不能出现在字段内，先替换掉。
+ */
+function playFieldsOf(
+  v: any,
+  spiderId: string,
+  playHref: (spiderId: string, id: string) => string,
+): { from: string; url: string } {
+  const direct = String(v?.vod_play_url || "")
+  if (direct) return { from: String(v?.vod_play_from || "OmniBox"), url: direct }
+
+  const sources = Array.isArray(v?.vod_play_sources) ? v.vod_play_sources : []
+  const froms: string[] = []
+  const urls: string[] = []
+  for (const s of sources) {
+    const eps = Array.isArray(s?.episodes) ? s.episodes : []
+    if (!eps.length) continue
+    const items: string[] = []
+    for (const e of eps) {
+      const raw = e?.playId ?? e?.url ?? e?.playUrl ?? ""
+      const id = typeof raw === "string" ? raw : JSON.stringify(raw)
+      if (!id) continue
+      const name = String(e?.name || "正片").replace(/[$#]/g, " ")
+      items.push(`${name}$${playHref(spiderId, id)}`)
+    }
+    if (!items.length) continue
+    froms.push(String(s?.name || "线路").replace(/[$#]/g, " "))
+    urls.push(items.join("#"))
+  }
+  if (!froms.length) return { from: String(v?.vod_play_from || "OmniBox"), url: "" }
+  return { from: froms.join("$$$"), url: urls.join("$$$") }
+}
+
+function fromSpiderVod(
+  v: any,
+  spiderId: string,
+  spiderName: string,
+  playHref: (spiderId: string, id: string) => string,
+): any {
+  const play = playFieldsOf(v, spiderId, playHref)
   const playId = String(v?.vod_id ?? v?.id ?? v?.playId ?? "")
-  const playUrl = v?.vod_play_url || v?.url || ""
   return {
     vod_id: `spider:${spiderId}:${b64urlEncode(playId)}`,
     vod_name: String(v?.vod_name || v?.title || v?.name || "未命名"),
@@ -78,8 +120,8 @@ function fromSpiderVod(v: any, spiderId: string, spiderName: string): any {
     vod_actor: String(v?.vod_actor || v?.actors || ""),
     vod_director: String(v?.vod_director || v?.director || ""),
     vod_content: String(v?.vod_content || v?.description || v?.plot || ""),
-    vod_play_from: String(v?.vod_play_from || "OmniBox"),
-    vod_play_url: typeof playUrl === "string" ? playUrl : "",
+    vod_play_from: play.from,
+    vod_play_url: play.url,
     vod_tag: "spider",
   }
 }
@@ -339,7 +381,7 @@ async function buildConfigFromSelection(
     sites.push({
       key: "omnibox_netdisk",
       name: "OmniBox 网盘",
-      type: 3,
+      type: 1,
       api: netdiskParams.length ? `${apiUrl}?${netdiskParams.join("&")}` : apiUrl,
       searchable: 1,
       filterable: 0,
@@ -357,10 +399,11 @@ async function buildConfigFromSelection(
     const params: string[] = []
     if (code) params.push(`code=${encodeURIComponent(code)}`)
     params.push(`spider=${encodeURIComponent(sp.id)}`)
+    if (baseUrl) params.push(`base=${encodeURIComponent(baseUrl)}`)
     sites.push({
       key: `spider_${sp.id}`,
       name: sp.name || sp.id,
-      type: 3,
+      type: 1,
       api: `${abs("/@tvbox/spider")}?${params.join("&")}`,
       searchable: 1,
       filterable: 0,
@@ -372,7 +415,7 @@ async function buildConfigFromSelection(
     sites.push({
       key: "omnibox_netdisk",
       name: "OmniBox 网盘",
-      type: 3,
+      type: 1,
       api: netdiskParams.length ? `${apiUrl}?${netdiskParams.join("&")}` : apiUrl,
       searchable: 1,
       filterable: 0,
@@ -447,7 +490,7 @@ tvboxRouter.get("/config.json", async (c) => {
         sites.push({
           key: "openlist",
           name: "OpenList 网盘",
-          type: 3,
+          type: 1,
           api: `${apiUrl}?${params.join("&")}`,
           searchable: 1,
           filterable: 0,
@@ -477,12 +520,15 @@ function toTvboxClasses(raw: any): any[] {
     .filter((x) => x.type_id)
 }
 
-/** 调 home() 取该源自己的分类（带缓存）；返回分类与首页推荐列表。 */
-async function loadSpiderHome(c: any, sp: any): Promise<{ cls: any[]; list: any[] }> {
+/** 调 home() 取该源自己的分类（带缓存）；返回分类、首页列表与失败原因。 */
+async function loadSpiderHome(
+  c: any,
+  sp: any,
+): Promise<{ cls: any[]; list: any[]; error?: string }> {
   const hit = spiderClassCache.get(sp.id)
   if (hit && Date.now() - hit.ts < SPIDER_CLASS_TTL) return { cls: hit.cls, list: [] }
-  const res = await runSpider(sp, "home", { page: 1 }, { from: "home", env: c.env })
-  if (!res.ok) return { cls: [], list: [] }
+  const res = await runSpider(sp, "home", { page: 1 }, { from: "tvbox", env: c.env })
+  if (!res.ok) return { cls: [], list: [], error: res.error || "home failed" }
   const d = res.data || {}
   const cls = toTvboxClasses(d.class)
   const list = Array.isArray(d.list) ? d.list : []
@@ -521,6 +567,18 @@ tvboxRouter.get("/spider", async (c) => {
   const page = pageOf(c)
   const limit = 60
 
+  // 选集跳转地址：vod_play_url 里每集必须是能 GET 到流的 http(s) 地址。
+  // 裸 playId 不是 URL，客户端会丢弃整集，所以统一走 /@tvbox/play 302。
+  const code = envValue(c, "TVBOX_ACCESS_CODE")
+  const baseParam = (c.req.query("base") || "").trim()
+  const playHref = (sid: string, id: string) => {
+    const base = requestUrl(c, "/@tvbox/play", baseParam)
+    const parts = [`spider=${encodeURIComponent(sid)}`]
+    if (code) parts.push(`code=${encodeURIComponent(code)}`)
+    parts.push(`id=${b64urlEncode(id)}`)
+    return `${base}?${parts.join("&")}`
+  }
+
   // 详情 / 播放
   if (ids.startsWith("spider:")) {
     try {
@@ -529,13 +587,13 @@ tvboxRouter.get("/spider", async (c) => {
       const playId = b64urlDecode(parts[2] || "")
       const sp = spiders.find((s: any) => s.id === sid)
       if (!sp) return c.json({ code: 404, message: "spider not found", ...emptyBody }, 404)
-      const detailRes = await runSpider(sp, "detail", { playId, id: playId }, { from: "detail", env: c.env })
-      const playRes = await runSpider(sp, "play", { playId }, { from: "play", env: c.env })
+      const detailRes = await runSpider(sp, "detail", { playId, id: playId }, { from: "tvbox", env: c.env })
+      const playRes = await runSpider(sp, "play", { playId }, { from: "tvbox", env: c.env })
       const base = detailRes.data?.list?.[0] || detailRes.data || {}
       const playData = playRes.data || {}
       const urls = Array.isArray(playData.urls) ? playData.urls : []
       const playText = urls
-        .map((u: any) => `${u.name || "线路"}$${u.url || u.play_url || ""}`)
+        .map((u: any) => `${String(u.name || "线路").replace(/[$#]/g, " ")}$${u.url || u.play_url || ""}`)
         .join("#")
       const vod = fromSpiderVod(
         {
@@ -546,6 +604,7 @@ tvboxRouter.get("/spider", async (c) => {
         },
         sp.id,
         sp.name,
+        playHref,
       )
       return c.json({ class: [], list: [vod], page: 1, pagecount: 1, limit: 1, total: 1 })
     } catch (e: any) {
@@ -553,21 +612,41 @@ tvboxRouter.get("/spider", async (c) => {
     }
   }
 
-  // 分类：来自各源 home()（单源时即该源自己的分类）
+  // 分类：来自各源 home()（单源时即该源自己的分类），并收集失败原因
   let classes: any[] = []
+  const errors: string[] = []
+  const homeResults: { sp: any; cls: any[]; list: any[]; error?: string }[] = []
   for (const sp of spiders) {
     const home = await loadSpiderHome(c, sp)
     classes = classes.concat(home.cls)
+    homeResults.push({ sp, ...home })
+    if (home.error) errors.push(`${sp.name || sp.id}: ${home.error}`)
   }
 
-  // 只请求分类列表（TVBox 首屏 ac=list）
+  // 只请求分类列表（SUTV/TVBox 首屏 ac=list）
   if (ac === "list" && !keyword && !typeId) {
     if (spiders.length === 1) {
-      const home = await loadSpiderHome(c, spiders[0])
-      const list = home.list.map((v: any) => fromSpiderVod(v, spiders[0].id, spiders[0].name))
+      const first = homeResults[0]
+      const list = first.list.map((v: any) => fromSpiderVod(v, first.sp.id, first.sp.name, playHref))
+      if (!list.length && first.error) {
+        // 业务错误写进 body（HTTP 保持 200，避免标准 TVBox 报「网络错误」）
+        return c.json(
+          {
+            code: 500,
+            message: `爬虫取数失败：${first.error}`,
+            class: classes,
+            list: [],
+            page: 1,
+            pagecount: 1,
+            limit,
+            total: 0,
+          },
+          200,
+        )
+      }
       return c.json({ class: classes, list: list.slice(0, limit), page: 1, pagecount: 1, limit, total: list.length })
     }
-    return c.json({ ...emptyBody, class: classes })
+    return c.json({ code: errors.length ? 500 : 200, message: errors.join("；"), ...emptyBody, class: classes })
   }
 
   const rows: any[] = []
@@ -583,9 +662,10 @@ tvboxRouter.get("/spider", async (c) => {
         method = "category"
         params = { categoryId: typeId, page }
       }
-      const res = await runSpider(sp, method, params, { from: method, env: c.env })
+      const res = await runSpider(sp, method, params, { from: "tvbox", env: c.env })
       if (!res.ok) {
         console.warn(`[tvbox] spider ${sp.id}.${method} failed: ${res.error}`)
+        errors.push(`${sp.name || sp.id}: ${res.error}`)
         continue
       }
       const list = Array.isArray(res.data?.list) ? res.data.list : []
@@ -593,7 +673,23 @@ tvboxRouter.get("/spider", async (c) => {
         const extra = toTvboxClasses(res.data?.class)
         if (extra.length) classes = extra
       }
-      for (const v of list) rows.push(fromSpiderVod(v, sp.id, sp.name))
+      for (const v of list) rows.push(fromSpiderVod(v, sp.id, sp.name, playHref))
+    }
+
+    if (!rows.length && errors.length) {
+      return c.json(
+        {
+          code: 500,
+          message: `爬虫取数失败：${errors.slice(0, 3).join("；")}`,
+          class: classes,
+          list: [],
+          page,
+          pagecount: 1,
+          limit,
+          total: 0,
+        },
+        200,
+      )
     }
 
     // 注意：spider 的 category/search 已按 page 分页，不能再二次切片，否则第 2 页为空。
@@ -609,6 +705,67 @@ tvboxRouter.get("/spider", async (c) => {
   } catch (e: any) {
     return c.json({ code: 500, message: safeErrorMessage(e), class: classes, list: [] }, 500)
   }
+})
+
+/**
+ * 选集跳转：/@tvbox/play?spider=&id=&code=
+ *
+ * vod_play_url 里写这个地址：客户端 GET 时即时调 play() 再 302 到真实流地址。
+ * SUTV 会把选集地址直接当流地址播放，裸 playId 不是 URL，整集会被丢弃。
+ */
+tvboxRouter.get("/play", async (c) => {
+  const denied = await accessDenied(c)
+  if (denied) return denied
+
+  const cfg = await readConfig(c)
+  const sid = (c.req.query("spider") || "").trim()
+  const sp = cfg.spiders.find((s: any) => s.id === sid && s.enabled !== false)
+  if (!sp) return c.json({ code: 404, message: "spider not found" }, 404)
+
+  let playId = ""
+  try {
+    playId = b64urlDecode(c.req.query("id") || "")
+  } catch {
+    return c.json({ code: 400, message: "bad id" }, 400)
+  }
+  if (!playId) return c.json({ code: 400, message: "missing id" }, 400)
+
+  const res = await runSpider(sp, "play", { playId }, { from: "tvbox", env: c.env })
+  if (!res.ok) return c.json({ code: 500, message: res.error || "play failed" }, 500)
+
+  const data = res.data || {}
+  const first = Array.isArray(data.urls) && data.urls[0] ? data.urls[0] : {}
+  const url = String(data.url || first.url || first.play_url || first.playUrl || "")
+  if (!url) return c.json({ code: 502, message: "empty play url" }, 502)
+
+  return c.redirect(url, 302)
+})
+
+/**
+ * 调试端点：/＠tvbox/debug?spider=<id>&method=home
+ * 直接跑一次脚本并返回 ok / error / keys / sample，便于定位源问题。
+ */
+tvboxRouter.get("/debug", async (c) => {
+  const denied = await accessDenied(c)
+  if (denied) return denied
+  const cfg = await readConfig(c)
+  const id = (c.req.query("spider") || "").trim()
+  const method = (c.req.query("method") || "home").trim()
+  const sp = cfg.spiders.find((s: any) => s.id === id)
+  if (!sp) return c.json({ code: 404, message: "spider not found" }, 404)
+  const started = Date.now()
+  const r = await runSpider(sp, method, { page: 1, categoryId: c.req.query("t") || "", keyword: c.req.query("wd") || "" }, { from: "tvbox", env: c.env })
+  return c.json({
+    code: 200,
+    spider: sp.id,
+    name: sp.name,
+    method,
+    ok: r.ok,
+    error: r.error || "",
+    ms: Date.now() - started,
+    keys: r.data && typeof r.data === "object" ? Object.keys(r.data) : [],
+    sample: JSON.stringify(r.data || null).slice(0, 1200),
+  })
 })
 
 tvboxRouter.get("/api", async (c) => {
