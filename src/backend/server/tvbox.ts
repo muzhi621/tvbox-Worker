@@ -71,13 +71,30 @@ type SpiderRef = { id: string; name: string; code: string }
  * 因此统一换成 /@tvbox/play 跳转地址（playHref 负责生成本源绝对地址）。
  * 线路分隔 $$$、集分隔 #、集名与地址分隔 $，三者不能出现在字段内，先替换掉。
  */
-function playFieldsOf(
+export function playFieldsOf(
   v: any,
   spiderId: string,
-  playHref: (spiderId: string, id: string) => string,
+  playHref: (spiderId: string, id: string, flag?: string) => string,
 ): { from: string; url: string } {
   const direct = String(v?.vod_play_url || "")
-  if (direct) return { from: String(v?.vod_play_from || "OmniBox"), url: direct }
+  if (direct) {
+    // 脚本偶尔直接给裸 vod_play_url（地址是 playId），也要把非 URL 的集包成跳转地址
+    const wrapped = direct
+      .split("$$$")
+      .map((line) =>
+        line
+          .split("#")
+          .map((ep) => {
+            const idx = ep.indexOf("$")
+            const name = idx >= 0 ? ep.slice(0, idx) : ep
+            const addr = idx >= 0 ? ep.slice(idx + 1) : ""
+            return /^https?:/i.test(addr) ? ep : `${name}$${playHref(spiderId, addr)}`
+          })
+          .join("#"),
+      )
+      .join("$$$")
+    return { from: String(v?.vod_play_from || "OmniBox"), url: wrapped }
+  }
 
   const sources = Array.isArray(v?.vod_play_sources) ? v.vod_play_sources : []
   const froms: string[] = []
@@ -85,27 +102,29 @@ function playFieldsOf(
   for (const s of sources) {
     const eps = Array.isArray(s?.episodes) ? s.episodes : []
     if (!eps.length) continue
+    const lineName = String(s?.name || "线路").replace(/[$#]/g, " ")
     const items: string[] = []
     for (const e of eps) {
       const raw = e?.playId ?? e?.url ?? e?.playUrl ?? ""
       const id = typeof raw === "string" ? raw : JSON.stringify(raw)
       if (!id) continue
       const name = String(e?.name || "正片").replace(/[$#]/g, " ")
-      items.push(`${name}$${playHref(spiderId, id)}`)
+      // 把线路名作为 flag 带上，播放阶段脚本才能选对线路
+      items.push(`${name}$${playHref(spiderId, id, lineName)}`)
     }
     if (!items.length) continue
-    froms.push(String(s?.name || "线路").replace(/[$#]/g, " "))
+    froms.push(lineName)
     urls.push(items.join("#"))
   }
   if (!froms.length) return { from: String(v?.vod_play_from || "OmniBox"), url: "" }
   return { from: froms.join("$$$"), url: urls.join("$$$") }
 }
 
-function fromSpiderVod(
+export function fromSpiderVod(
   v: any,
   spiderId: string,
   spiderName: string,
-  playHref: (spiderId: string, id: string) => string,
+  playHref: (spiderId: string, id: string, flag?: string) => string,
 ): any {
   const play = playFieldsOf(v, spiderId, playHref)
   const playId = String(v?.vod_id ?? v?.id ?? v?.playId ?? "")
@@ -567,45 +586,78 @@ tvboxRouter.get("/spider", async (c) => {
   const page = pageOf(c)
   const limit = 60
 
-  // 选集跳转地址：vod_play_url 里每集必须是能 GET 到流的 http(s) 地址。
-  // 裸 playId 不是 URL，客户端会丢弃整集，所以统一走 /@tvbox/play 302。
+  // 选集解析：GET /@tvbox/spider?code=&spider=&ac=play&id=&flag=
+  // 不新建 /@tvbox/play：该路径与文件/静态路由冲突（实测被 requireCode 挡成 401
+  // 或落回 HTML）。挂在 /spider 上复用已验证的鉴权与单源解析，零新增路由。
   const code = envValue(c, "TVBOX_ACCESS_CODE")
   const baseParam = (c.req.query("base") || "").trim()
-  const playHref = (sid: string, id: string) => {
-    const base = requestUrl(c, "/@tvbox/play", baseParam)
-    const parts = [`spider=${encodeURIComponent(sid)}`]
+  const playHref = (sid: string, id: string, flag = "") => {
+    const base = requestUrl(c, "/@tvbox/spider", baseParam)
+    const parts: string[] = []
     if (code) parts.push(`code=${encodeURIComponent(code)}`)
-    parts.push(`id=${b64urlEncode(id)}`)
+    parts.push(`spider=${encodeURIComponent(sid)}`, "ac=play", `id=${b64urlEncode(id)}`)
+    if (flag) parts.push(`flag=${encodeURIComponent(flag)}`)
     return `${base}?${parts.join("&")}`
   }
 
-  // 详情 / 播放
+  if (ac === "play") {
+    const rawId = (c.req.query("id") || "").trim()
+    let playId = ""
+    try {
+      playId = b64urlDecode(rawId)
+    } catch {
+      playId = ""
+    }
+    if (!playId) return c.json({ code: 400, message: "missing id", ...emptyBody }, 400)
+    const sp = spiders[0]
+    const flag = (c.req.query("flag") || "").trim()
+    const res = await runSpider(sp, "play", { playId, flag, videoId: playId }, { from: "tvbox", env: c.env })
+    if (!res.ok) {
+      return c.json({ code: 500, message: `播放失败：${res.error}`, ...emptyBody }, 200)
+    }
+    const data = res.data || {}
+    const first = Array.isArray(data.urls) && data.urls[0] ? data.urls[0] : {}
+    const url = String(data.url || first.url || first.play_url || first.playUrl || "")
+    if (!url) {
+      return c.json({ code: 502, message: data.error || "empty play url", ...emptyBody }, 200)
+    }
+    const header = data.header || first.header || {}
+    // SUTV 3.0.57+ 带 Accept: application/json —— 回 JSON，header 才能交给播放器
+    // （302 带不出 header，CDN 校验 Referer 时会失败）。其他客户端维持 302。
+    if ((c.req.header("accept") || "").toLowerCase().includes("application/json")) {
+      return c.json({ code: 200, url, header })
+    }
+    return c.redirect(url, 302)
+  }
+
+  // 详情：只取元数据 + 选集结构，不在详情阶段解析播放地址
+  // （详情阶段调 play() 会丢线路、变慢，且此时不知道用户选哪条线路）
   if (ids.startsWith("spider:")) {
     try {
       const parts = ids.split(":")
       const sid = parts[1] || ""
-      const playId = b64urlDecode(parts[2] || "")
-      const sp = spiders.find((s: any) => s.id === sid)
-      if (!sp) return c.json({ code: 404, message: "spider not found", ...emptyBody }, 404)
-      const detailRes = await runSpider(sp, "detail", { playId, id: playId }, { from: "tvbox", env: c.env })
-      const playRes = await runSpider(sp, "play", { playId }, { from: "tvbox", env: c.env })
-      const base = detailRes.data?.list?.[0] || detailRes.data || {}
-      const playData = playRes.data || {}
-      const urls = Array.isArray(playData.urls) ? playData.urls : []
-      const playText = urls
-        .map((u: any) => `${String(u.name || "线路").replace(/[$#]/g, " ")}$${u.url || u.play_url || ""}`)
-        .join("#")
-      const vod = fromSpiderVod(
-        {
-          ...base,
-          vod_id: playId,
-          vod_play_from: playData.parse ? "OmniBox解析" : "OmniBox",
-          vod_play_url: playText,
-        },
-        sp.id,
-        sp.name,
-        playHref,
+      let videoId = ""
+      try {
+        videoId = b64urlDecode(parts[2] || "")
+      } catch {
+        videoId = ""
+      }
+      if (!videoId) return c.json({ code: 400, message: "bad id", ...emptyBody }, 400)
+      // 不限定「本次选中的源」：配置重建 / 源禁用后旧 vod_id 仍会进来
+      const sp = cfg.spiders.find((s: any) => s.id === sid && s.enabled !== false)
+      if (!sp) return c.json({ code: 404, message: `spider not found: ${sid}`, ...emptyBody }, 404)
+      // P0-3：videoId 是主流入参名，playId/id 兜底
+      const detailRes = await runSpider(
+        sp,
+        "detail",
+        { videoId, playId: videoId, id: videoId },
+        { from: "tvbox", env: c.env },
       )
+      if (!detailRes.ok) {
+        return c.json({ code: 500, message: `详情失败：${detailRes.error}`, ...emptyBody }, 200)
+      }
+      const base = detailRes.data?.list?.[0] || detailRes.data || {}
+      const vod = fromSpiderVod({ ...base, vod_id: videoId }, sp.id, sp.name, playHref)
       return c.json({ class: [], list: [vod], page: 1, pagecount: 1, limit: 1, total: 1 })
     } catch (e: any) {
       return c.json({ code: 500, message: safeErrorMessage(e), ...emptyBody }, 500)
@@ -705,40 +757,6 @@ tvboxRouter.get("/spider", async (c) => {
   } catch (e: any) {
     return c.json({ code: 500, message: safeErrorMessage(e), class: classes, list: [] }, 500)
   }
-})
-
-/**
- * 选集跳转：/@tvbox/play?spider=&id=&code=
- *
- * vod_play_url 里写这个地址：客户端 GET 时即时调 play() 再 302 到真实流地址。
- * SUTV 会把选集地址直接当流地址播放，裸 playId 不是 URL，整集会被丢弃。
- */
-tvboxRouter.get("/play", async (c) => {
-  const denied = await accessDenied(c)
-  if (denied) return denied
-
-  const cfg = await readConfig(c)
-  const sid = (c.req.query("spider") || "").trim()
-  const sp = cfg.spiders.find((s: any) => s.id === sid && s.enabled !== false)
-  if (!sp) return c.json({ code: 404, message: "spider not found" }, 404)
-
-  let playId = ""
-  try {
-    playId = b64urlDecode(c.req.query("id") || "")
-  } catch {
-    return c.json({ code: 400, message: "bad id" }, 400)
-  }
-  if (!playId) return c.json({ code: 400, message: "missing id" }, 400)
-
-  const res = await runSpider(sp, "play", { playId }, { from: "tvbox", env: c.env })
-  if (!res.ok) return c.json({ code: 500, message: res.error || "play failed" }, 500)
-
-  const data = res.data || {}
-  const first = Array.isArray(data.urls) && data.urls[0] ? data.urls[0] : {}
-  const url = String(data.url || first.url || first.play_url || first.playUrl || "")
-  if (!url) return c.json({ code: 502, message: "empty play url" }, 502)
-
-  return c.redirect(url, 302)
 })
 
 /**

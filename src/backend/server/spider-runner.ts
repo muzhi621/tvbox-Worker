@@ -1,5 +1,7 @@
 import vm from "node:vm"
-import * as parse5 from "parse5"
+// 用 slim 入口：只含 HTML 解析与选择器（脚本只需 cheerio.load），
+// 不含 undici / encoding-sniffer，产物更小且不依赖被 external 的 iconv-lite。
+import * as cheerio from "cheerio/slim"
 
 /**
  * OmniBox JS 爬虫沙箱运行器。
@@ -9,8 +11,8 @@ import * as parse5 from "parse5"
  *     管理员自己导入，访问码校验在路由层完成。
  *  2. omnibox_sdk shim：request 走 fetch；log 走 console；需要 Chromium 的
  *     sniffVideo / 刮削 / 弹幕 / 网盘能力返回安全空值，避免误判成功。
- *  3. cheerio shim 基于项目已有 parse5，覆盖 .load / .each / .find / .attr /
- *     .text 等采集脚本常用 API。
+ *  3. cheerio 用真实 npm 包（脚本按 jQuery 写法，自制 shim 覆盖不了 .next/.parents/:has）；
+ *     axios 也做成可调用函数（脚本里 axios(cfg) 与 axios.get 混用）。
  *  4. 脚本必须 CommonJS 导出 { home, category, detail, search, play }；
  *     runner.run(module.exports) 在 shim 中是空操作，避免抢占 stdin。
  */
@@ -44,235 +46,6 @@ export type SpiderModule = {
   search?: (params: any, ctx: any) => Promise<any>
   play?: (params: any, ctx: any) => Promise<any>
   init?: (ctx: any) => Promise<any> | any
-}
-
-const isElement = (n: any) => !!n && n.nodeName !== "#text" && n.nodeName !== "#comment" && Array.isArray(n.attrs)
-const childrenOf = (n: any): any[] => (n && Array.isArray(n.childNodes) ? n.childNodes : [])
-
-function textOf(node: any): string {
-  if (!node) return ""
-  if (node.nodeName === "#text") return String(node.value || "")
-  if (node.nodeName === "#comment") return ""
-  return childrenOf(node).map(textOf).join("")
-}
-
-function attrOf(node: any, name: string): string | undefined {
-  if (!node || !isElement(node)) return undefined
-  const attr = (node.attrs || []).find((a: any) => a.name === name)
-  return attr ? String(attr.value ?? "") : undefined
-}
-
-type Sel = { tag?: string; id?: string; cls?: string; attr?: [string, string]; pseudo?: string }
-
-function parseSelector(raw: string): Sel[] {
-  return String(raw || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((s) => {
-      let work = s
-      let pseudo: string | undefined
-      const pm = work.match(/:(first|last|nth-child\(\d+\))$/i)
-      if (pm) {
-        pseudo = pm[1].toLowerCase()
-        work = work.slice(0, -pm[0].length)
-      }
-      const attrMatch = work.match(/\[([A-Za-z0-9_:-]+)(?:=["']?([^\]"']*)["']?)?\]/)
-      let attr: [string, string] | undefined
-      if (attrMatch) {
-        attr = [attrMatch[1].toLowerCase(), attrMatch[2] || ""]
-        work = work.replace(attrMatch[0], "")
-      }
-      const idMatch = work.match(/#([A-Za-z0-9_-]+)/)
-      const clsMatch = work.match(/\.([A-Za-z0-9_-]+)/)
-      const tagMatch = work.match(/^([A-Za-z][A-Za-z0-9-]*)/)
-      return {
-        tag: tagMatch?.[1]?.toLowerCase(),
-        id: idMatch?.[1],
-        cls: clsMatch?.[1],
-        attr,
-        pseudo,
-      }
-    })
-}
-
-function matches(node: any, sel: Sel): boolean {
-  if (!isElement(node)) return false
-  if (sel.tag && String(node.tagName || node.nodeName).toLowerCase() !== sel.tag) return false
-  if (sel.id && attrOf(node, "id") !== sel.id) return false
-  if (sel.cls) {
-    const cls = String(attrOf(node, "class") || "")
-      .split(/\s+/)
-      .filter(Boolean)
-    if (!cls.includes(sel.cls)) return false
-  }
-  if (sel.attr) {
-    const v = attrOf(node, sel.attr[0])
-    if (v === undefined) return false
-    if (sel.attr[1] && v !== sel.attr[1]) return false
-  }
-  return true
-}
-
-function walk(root: any, fn: (n: any) => void) {
-  if (!root) return
-  fn(root)
-  for (const c of childrenOf(root)) walk(c, fn)
-}
-
-function applyPseudo(nodes: any[], pseudo?: string): any[] {
-  if (!pseudo || nodes.length <= 1) return nodes
-  if (pseudo === "first") return nodes.slice(0, 1)
-  if (pseudo === "last") return nodes.slice(-1)
-  const m = pseudo.match(/nth-child\((\d+)\)/)
-  if (m) {
-    const idx = Number(m[1]) - 1
-    return idx >= 0 && idx < nodes.length ? [nodes[idx]] : []
-  }
-  return nodes
-}
-
-function select(root: any, selector: string): any[] {
-  const groups = String(selector || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-  const result: any[] = []
-  for (const group of groups) {
-    // 支持后代选择器：按空格拆成多段，逐层缩小
-    const parts = group.split(/\s+/).filter(Boolean)
-    let current: any[] = [root]
-    for (const part of parts) {
-      const sels = parseSelector(part)
-      const next: any[] = []
-      for (const base of current) {
-        for (const sel of sels) {
-          const hits: any[] = []
-          walk(base, (n) => {
-            if (n !== base && matches(n, sel)) hits.push(n)
-          })
-          if (sels.length === 1 && sel.pseudo) next.push(...applyPseudo(hits, sel.pseudo))
-          else next.push(...hits)
-        }
-      }
-      current = next
-    }
-    result.push(...current)
-  }
-  return result
-}
-
-function makeSelection(nodes: any[], root?: any) {
-  const api: any = {
-    length: nodes.length,
-    [Symbol.iterator]: function* () {
-      yield* nodes
-    },
-    each(fn: (i: number, el: any) => void) {
-      nodes.forEach((n, i) => fn(i, n))
-      return api
-    },
-    map(fn: (i: number, el: any) => any) {
-      return nodes.map((n, i) => fn(i, n))
-    },
-    get(i = 0) {
-      return nodes[i]
-    },
-    eq(i: number) {
-      return makeSelection([nodes[i]], root)
-    },
-    first() {
-      return makeSelection(nodes.slice(0, 1), root)
-    },
-    last() {
-      return makeSelection(nodes.slice(-1), root)
-    },
-    find(selector: string) {
-      const out: any[] = []
-      for (const n of nodes) out.push(...select(n, selector))
-      return makeSelection(out, root)
-    },
-    closest(selector: string) {
-      const out: any[] = []
-      for (let n = nodes[0]; n; n = n.parentNode) {
-        if (matches(n, parseSelector(selector)[0])) {
-          out.push(n)
-          break
-        }
-      }
-      return makeSelection(out, root)
-    },
-    attr(name: string, value?: string) {
-      if (value !== undefined) {
-        for (const n of nodes) {
-          if (!isElement(n)) continue
-          const attr = (n.attrs || []).find((a: any) => a.name === name)
-          if (attr) attr.value = value
-          else n.attrs.push({ name, value })
-        }
-        return api
-      }
-      return nodes.length ? attrOf(nodes[0], name) : undefined
-    },
-    data(name: string) {
-      return api.attr(`data-${name}`)
-    },
-    text() {
-      return nodes.map((n) => textOf(n)).join("")
-    },
-    html() {
-      if (!nodes.length) return ""
-      try {
-        return nodes.map((n) => parse5.serialize(n)).join("") || textOf(nodes[0])
-      } catch {
-        return textOf(nodes[0])
-      }
-    },
-    parent() {
-      const out = nodes.map((n) => n.parentNode).filter(Boolean)
-      return makeSelection(out, root)
-    },
-    children() {
-      const out: any[] = []
-      for (const n of nodes) out.push(...childrenOf(n).filter(isElement))
-      return makeSelection(out, root)
-    },
-    is(selector: string) {
-      return nodes.some((n) => matches(n, parseSelector(selector)[0]))
-    },
-    remove() {
-      for (const n of nodes) {
-        if (n.parentNode && Array.isArray(n.parentNode.childNodes)) {
-          n.parentNode.childNodes = n.parentNode.childNodes.filter((c: any) => c !== n)
-        }
-      }
-      return api
-    },
-  }
-  return api
-}
-
-function linkParents(node: any, parent?: any) {
-  if (!node) return
-  if (parent) node.parentNode = parent
-  for (const c of childrenOf(node)) linkParents(c, node)
-}
-
-function cheerioShim() {
-  return {
-    load(source: string) {
-      const doc: any = parse5.parse(String(source || ""))
-      linkParents(doc)
-      const rootFn: any = (input: any) =>
-        input && typeof input === "object" && input.nodeName
-          ? makeSelection([input], doc)
-          : makeSelection(select(doc, String(input || "")), doc)
-      rootFn.root = () => makeSelection([doc], doc)
-      rootFn.html = () => parse5.serialize(doc)
-      rootFn.text = () => textOf(doc)
-      return rootFn
-    },
-  }
 }
 
 function sdkShim(ctx: { fetch: typeof fetch; log: (...a: any[]) => void }) {
@@ -395,7 +168,7 @@ export async function runSpider(
   const scriptEnv = safeScriptEnv(context?.env)
   const requireShim = (name: string) => {
     if (name === "omnibox_sdk") return sdk
-    if (name === "cheerio") return cheerioShim()
+    if (name === "cheerio") return cheerio
     if (name === "spider_runner") return { run: () => {}, OmniBox: sdk }
     if (name === "vm" || name === "node:vm") {
       return {
@@ -419,12 +192,12 @@ export async function runSpider(
       }
     }
     if (name === "axios") {
-      // 脚本按真实 axios 写：res.data 是解析后的对象、res.status 是数字
-      const asJson = (text: string) => {
+      // 脚本里 axios({url}) / axios.request(cfg) / axios.get() 混用 —— axios 本身必须是函数
+      const asJson = (t: string) => {
         try {
-          return JSON.parse(text)
+          return JSON.parse(t)
         } catch {
-          return text
+          return t
         }
       }
       const wrap = (r: any) => ({
@@ -433,20 +206,55 @@ export async function runSpider(
         headers: r.headers,
         data: asJson(r.body),
       })
-      const get = async (url: string, cfg: any = {}) =>
-        wrap(await sdk.request(url, { ...cfg, method: "GET" }))
-      const post = async (url: string, body: any, cfg: any = {}) =>
-        wrap(await sdk.request(url, { ...cfg, method: "POST", body }))
-      return {
-        create: () => ({
-          get,
-          post,
-          request: async (cfg: any) => wrap(await sdk.request(cfg.url, cfg)),
-        }),
-        get,
-        post,
-        request: async (cfg: any) => wrap(await sdk.request(cfg.url, cfg)),
+      const send = async (url: string, cfg: any = {}) => {
+        const o = { ...cfg }
+        if (o.data !== undefined && o.body === undefined) o.body = o.data
+        if (o.params) {
+          const q = new URLSearchParams(o.params).toString()
+          if (q && !String(url).includes("?")) url += `?${q}`
+        }
+        return wrap(await sdk.request(url, o))
       }
+      const axios: any = async (a: any, b: any = {}) =>
+        typeof a === "string" ? send(a, b) : send(a?.url, a)
+      axios.get = (url: string, cfg: any = {}) => send(url, { ...cfg, method: "GET" })
+      axios.post = (url: string, data: any, cfg: any = {}) => send(url, { ...cfg, data, method: "POST" })
+      axios.request = (cfg: any = {}) => send(cfg.url, cfg)
+      axios.create = (base: any = {}) => {
+        const inst: any = (a: any, b: any = {}) => {
+          const cfg = typeof a === "string" ? { ...b, url: a } : { ...(a || {}) }
+          if (base.baseURL && cfg.url && !/^https?:/i.test(cfg.url)) {
+            cfg.url = String(base.baseURL).replace(/\/$/, "") + "/" + String(cfg.url).replace(/^\//, "")
+          }
+          cfg.headers = { ...(base.headers || {}), ...(cfg.headers || {}) }
+          return send(cfg.url, cfg)
+        }
+        inst.get = (u: string, c2: any = {}) => inst({ ...c2, url: u, method: "GET" })
+        inst.post = (u: string, d: any, c2: any = {}) => inst({ ...c2, url: u, data: d, method: "POST" })
+        inst.request = (c2: any = {}) => inst(c2)
+        inst.defaults = { headers: { common: {} }, ...(base.defaults || {}) }
+        inst.interceptors = { request: { use: () => {} }, response: { use: () => {} } }
+        return inst
+      }
+      axios.defaults = { headers: { common: {} } }
+      axios.interceptors = { request: { use: () => {} }, response: { use: () => {} } }
+      return axios
+    }
+    if (name === "fs" || name === "node:fs") {
+      // 边缘运行时没有文件系统：给最小面，读不到就当空，脚本自己会降级
+      return {
+        existsSync: () => false,
+        readFileSync: () => {
+          throw new Error("fs is not available on edge runtime")
+        },
+        writeFileSync: () => {},
+        mkdirSync: () => {},
+        promises: { readFile: async () => "", writeFile: async () => {}, mkdir: async () => {} },
+      }
+    }
+    if (name === "crypto-js") {
+      // 假实现算出来的签名是错的，源会返回"参数错误"，比明确报错更难排查
+      throw new Error("该源依赖 crypto-js，当前运行时未提供")
     }
     if (name === "https") return { Agent: class {} }
     if (name === "http") return {}

@@ -128,6 +128,7 @@
     "bcryptjs": "^2.4.3",
     "bencode": "^4.0.0",
     "chardet": "^2.2.0",
+    "cheerio": "^1.0.0",
     "clsx": "^2.1.1",
     "copy-to-clipboard": "^3.3.3",
     "crypto-js": "^4.2.0",
