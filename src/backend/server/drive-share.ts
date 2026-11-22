@@ -32,6 +32,8 @@ const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 const SUPPORTED = new Set(["115", "aliyundrive", "123"])
+/** 能匿名列文件（详情可出集数），但播放需转存/登录的网盘 */
+const LIST_ONLY = new Set(["quark", "uc"])
 
 /** 从分享链接识别网盘并解析出 share 参数。 */
 export function parseShareUrl(raw: string): ShareInfo | null {
@@ -56,7 +58,7 @@ export function parseShareUrl(raw: string): ShareInfo | null {
     displayName,
     shareId: id,
     password: pwd,
-    supported: SUPPORTED.has(driveType),
+    supported: SUPPORTED.has(driveType) || LIST_ONLY.has(driveType),
   })
 
   if (/(^|\.)115(cdn)?\.com$/.test(host)) return make("115", "115网盘")
@@ -68,6 +70,54 @@ export function parseShareUrl(raw: string): ShareInfo | null {
   if (/(^|\.)drive\.uc\.cn$/.test(host) || /uc\.cn$/.test(host)) return make("uc", "UC网盘")
   if (/(^|\.)cloud\.189\.cn$/.test(host)) return make("189", "天翼云盘")
   return null
+}
+
+/** 夸克 / UC 分享：匿名获取 stoken（只需 pwd_id + 提取码）。 */
+async function quarkShareToken(host: string, pr: string, pwdId: string, passcode: string): Promise<string> {
+  const res = await fetch(`https://${host}/1/clouddrive/share/sharepage/token?pr=${pr}&fr=pc`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": BROWSER_UA },
+    body: JSON.stringify({ pwd_id: pwdId, passcode: passcode || "" }),
+    signal: AbortSignal.timeout(15000),
+  })
+  const j: any = await res.json().catch(() => ({}))
+  const stoken = j?.data?.stoken
+  if (!stoken) throw new Error(j?.message || "获取夸克分享 token 失败（分享失效或缺少提取码）")
+  return String(stoken)
+}
+
+/** 夸克 / UC 分享：列文件（匿名可列，播放仍需转存）。 */
+async function quarkShareDetail(
+  host: string,
+  pr: string,
+  pwdId: string,
+  stoken: string,
+  pdirFid: string,
+): Promise<any[]> {
+  const u = new URL(`https://${host}/1/clouddrive/share/sharepage/detail`)
+  u.searchParams.set("pr", pr)
+  u.searchParams.set("fr", "pc")
+  u.searchParams.set("pwd_id", pwdId)
+  u.searchParams.set("stoken", stoken)
+  u.searchParams.set("pdir_fid", pdirFid && pdirFid !== "0" ? pdirFid : "0")
+  u.searchParams.set("force", "0")
+  u.searchParams.set("_page", "1")
+  u.searchParams.set("_size", "100")
+  u.searchParams.set("_fetch_banner", "0")
+  u.searchParams.set("_fetch_share", "0")
+  u.searchParams.set("_fetch_total", "1")
+  u.searchParams.set("_sort", "file_type:asc,updated_at:desc")
+  const res = await fetch(u.toString(), {
+    headers: {
+      "User-Agent": BROWSER_UA,
+      Referer: pr === "UCBrowser" ? "https://drive.uc.cn/" : "https://pan.quark.cn/",
+    },
+    signal: AbortSignal.timeout(15000),
+  })
+  const j: any = await res.json().catch(() => ({}))
+  const list = j?.data?.list
+  if (!Array.isArray(list)) throw new Error(j?.message || "获取夸克分享文件列表失败")
+  return list
 }
 
 /** 列表缓存：123 网盘下载直链需要完整文件对象；同时减少重复请求。 */
@@ -93,7 +143,7 @@ export async function shareList(
   const p = parseShareUrl(raw)
   if (!p) throw new Error(`无法识别的分享链接：${String(raw).slice(0, 120)}`)
   if (!p.supported) {
-    throw new Error(`暂不支持${p.displayName}分享解析（当前支持 115 / 阿里云盘 / 123 网盘）`)
+    throw new Error(`暂不支持${p.displayName}分享解析（当前支持 115 / 阿里云盘 / 123 / 夸克 / UC）`)
   }
   if (!p.shareId) throw new Error(`分享链接缺少分享 ID：${String(raw).slice(0, 120)}`)
 
@@ -147,6 +197,18 @@ export async function shareList(
       isDir: f.Type === 1,
       raw: f,
     }))
+  } else if (p.driveType === "quark" || p.driveType === "uc") {
+    const host = p.driveType === "uc" ? "pc-api.uc.cn" : "drive-pc.quark.cn"
+    const pr = p.driveType === "uc" ? "UCBrowser" : "ucpro"
+    const stoken = await quarkShareToken(host, pr, p.shareId, p.password)
+    const items = await quarkShareDetail(host, pr, p.shareId, stoken, parentId)
+    files = items.map((f: any) => ({
+      fid: String(f.fid || ""),
+      name: String(f.file_name || f.name || "file"),
+      size: Number(f.size || 0) || 0,
+      isDir: f.dir === true || f.file_type === 0,
+      raw: f,
+    }))
   }
 
   listCache.set(key, { files, ts: Date.now() })
@@ -162,8 +224,11 @@ export async function sharePlay(
 ): Promise<{ url: { name: string; url: string }[]; header: Record<string, string> }> {
   const p = parseShareUrl(raw)
   if (!p) throw new Error(`无法识别的分享链接：${String(raw).slice(0, 120)}`)
+  if (LIST_ONLY.has(p.driveType)) {
+    throw new Error(`${p.displayName}分享播放需先转存到自己的网盘（暂未开放），可直接播放：115 / 阿里云盘 / 123`)
+  }
   if (!p.supported) {
-    throw new Error(`暂不支持${p.displayName}分享播放（当前支持 115 / 阿里云盘 / 123 网盘）`)
+    throw new Error(`暂不支持${p.displayName}分享播放（当前支持 115 / 阿里云盘 / 123）`)
   }
 
   if (p.driveType === "115") {
