@@ -16,7 +16,7 @@ import { scanMedia, getScanProgress, isScanRunning } from "../internal/media/sca
 import { readMounts } from "./tvbox-admin"
 import { runSpider } from "./spider-runner"
 import { registerSpiderLibraryRoutes } from "./spider-library"
-import { registerOmniBoxDataRoutes, readAppSection } from "./omnibox-extra"
+import { registerOmniBoxDataRoutes, readAppSection, writeAppSection } from "./omnibox-extra"
 import {
   accessDenied,
   envValue,
@@ -458,6 +458,15 @@ omniboxRouter.post("/subscribe", async (c) => {
     else {
       const code = envValue(c, "TVBOX_ACCESS_CODE")
       if (code) params.push(`code=${encodeURIComponent(code)}`)
+    }
+    // 把生成链接时的公网域名持久化到订阅，供短链接端点生成 api 地址使用。
+    // EdgeOne 云函数内部请求头可能被改写成内部域名，不能依赖运行时解析。
+    const publicBase = requestUrl(c, "", baseUrl)
+    if (publicBase && publicBase !== sub.baseUrl) {
+      const updated = subs.map((s: any) =>
+        s && String(s.id) === subId ? { ...s, baseUrl: publicBase } : s,
+      )
+      await writeAppSection(c, "subscriptions", updated)
     }
     const subPath = `/@tvbox/sub/${encodeURIComponent(subId)}`
     const url = requestUrl(c, subPath, baseUrl) + (params.length ? `?${params.join("&")}` : "")

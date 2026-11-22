@@ -64,6 +64,28 @@ export async function readAppSection(c: any, section: string): Promise<any> {
   return EMPTY[section]
 }
 
+/** 直接写入某个配置段（供 /subscribe 等服务端逻辑复用）。 */
+export async function writeAppSection(c: any, section: string, value: any): Promise<any> {
+  const key = SECTION_KEYS[section]
+  if (!key) return null
+  const clean = normalizeSection(section, value)
+  const db = await getDb(c.env)
+  if (!Array.isArray(db.settings)) db.settings = []
+  const row = db.settings.find((s: any) => s && s.key === key)
+  const encoded = JSON.stringify(clean)
+  if (row) {
+    row.value = encoded
+    row.type = "text"
+  } else {
+    db.settings.push({
+      key, value: encoded, type: "text",
+      help: `OmniBox ${section} (managed by /@omnibox)`, group: 99, flag: 0,
+    })
+  }
+  await saveDb(db, c.env)
+  return clean
+}
+
 export function registerOmniBoxDataRoutes(router: Hono) {
   router.get("/app-data", async (c) => {
     const out: any = {}

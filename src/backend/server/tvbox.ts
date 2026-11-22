@@ -320,12 +320,14 @@ async function buildConfigFromSelection(
   c: any,
   netdiskIds: string[],
   spiderIds: string[],
+  baseUrl = "",
 ): Promise<any> {
   const code = envValue(c, "TVBOX_ACCESS_CODE")
   const cfg = await readConfig(c)
   const sites: any[] = []
 
-  const apiUrl = absoluteUrl(c, "/@tvbox/api")
+  const abs = (path: string) => requestUrl(c, path, baseUrl)
+  const apiUrl = abs("/@tvbox/api")
   const netdiskParams: string[] = []
   if (code) netdiskParams.push(`code=${encodeURIComponent(code)}`)
   if (netdiskIds.length) {
@@ -352,7 +354,7 @@ async function buildConfigFromSelection(
     const spiderParams: string[] = []
     if (code) spiderParams.push(`code=${encodeURIComponent(code)}`)
     if (spiderIds.length) spiderParams.push(`spiders=${encodeURIComponent(spiderIds.join(","))}`)
-    const spiderApi = absoluteUrl(c, "/@tvbox/spider")
+    const spiderApi = abs("/@tvbox/spider")
     sites.push({
       key: "omnibox_spider",
       name: "OmniBox 爬虫源",
@@ -395,7 +397,7 @@ tvboxRouter.get("/sub/:id", async (c) => {
   }
   const netdiskIds: string[] = Array.isArray(sub.netdisk) ? sub.netdisk.map(String) : []
   const spiderIds: string[] = Array.isArray(sub.spiders) ? sub.spiders.map(String) : []
-  return c.json(await buildConfigFromSelection(c, netdiskIds, spiderIds))
+  return c.json(await buildConfigFromSelection(c, netdiskIds, spiderIds, String(sub.baseUrl || "")))
 })
 
 tvboxRouter.get("/config.json", async (c) => {

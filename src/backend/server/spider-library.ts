@@ -13,6 +13,45 @@ import { readConfig, saveConfig } from "./omnibox-store"
 
 const MAX_SCRIPT_BYTES = 512 * 1024
 
+/** 解析 GitHub 仓库地址，支持 owner/repo 与 /tree/branch/subpath。 */
+function parseRepoUrl(raw: string): { owner: string; repo: string; branch: string; subpath: string } | null {
+  let s = String(raw || "").trim().replace(/\/+$/, "")
+  if (!s) return null
+  // 去掉协议与域名，兼容 github.com/owner/repo 与完整 URL
+  s = s.replace(/^https?:\/\//i, "").replace(/^github\.com\//i, "")
+  const parts = s.split("/").filter(Boolean)
+  if (parts.length < 2) return null
+  const owner = parts[0]
+  const repo = parts[1].replace(/\.git$/i, "")
+  let branch = "main"
+  let subpath = ""
+  if (parts[2] === "tree" && parts[3]) {
+    branch = parts[3]
+    subpath = parts.slice(4).join("/")
+  }
+  if (!/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repo)) return null
+  return { owner, repo, branch, subpath }
+}
+
+/** 把 raw 地址套进下载代理模板（{url} 占位符）。 */
+function applyProxy(rawUrl: string, proxy: string): string {
+  const p = String(proxy || "").trim()
+  if (!p) return rawUrl
+  if (p.includes("{url}")) return p.replace(/\{url\}/g, encodeURIComponent(rawUrl))
+  try {
+    const u = new URL(p)
+    u.searchParams.set("url", rawUrl)
+    return u.toString()
+  } catch {
+    return rawUrl
+  }
+}
+
+function safeScriptName(path: string): string {
+  const base = path.split("/").pop() || path
+  return base.replace(/\.(js|py)$/i, "").slice(0, 80)
+}
+
 function selectedIds(body: any): string[] {
   const raw: any[] = Array.isArray(body?.ids)
     ? body.ids
@@ -202,5 +241,136 @@ export function registerSpiderLibraryRoutes(router: Hono) {
         200,
       )
     }
+  })
+
+  /**
+   * 浏览任意 GitHub 仓库的 js/py 文件树（OmniBox 2.x 风格导入第一步）。
+   */
+  router.post("/spider-library/browse", async (c) => {
+    const body = await c.req.json().catch(() => ({}))
+    const repo = parseRepoUrl(String(body.repo || body.url || ""))
+    if (!repo) {
+      return c.json({ code: 400, message: "请输入有效的 GitHub 仓库地址，如 https://github.com/owner/repo" }, 400)
+    }
+    try {
+      const apiUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/git/trees/${encodeURIComponent(repo.branch)}?recursive=1`
+      const res = await fetch(apiUrl, {
+        headers: { "User-Agent": "OmniBox-Worker/2.1" },
+        signal: AbortSignal.timeout(20000),
+      })
+      if (!res.ok) {
+        return c.json({ code: 400, message: `读取仓库失败：HTTP ${res.status}（仓库不存在或为私有）` }, 400)
+      }
+      const data: any = await res.json()
+      const prefix = repo.subpath ? repo.subpath.replace(/^\/+|\/+$/g, "") + "/" : ""
+      const files: { path: string; name: string; type: "JavaScript" | "Python"; url: string }[] = []
+      for (const x of data?.tree || []) {
+        if (x.type !== "blob" || !/\.(js|py)$/i.test(x.path)) continue
+        if (prefix && !x.path.startsWith(prefix)) continue
+        // 排除测试与无关目录
+        if (/^(tests?|docs?|examples?|\.github)\//i.test(x.path)) continue
+        const isPy = /\.py$/i.test(x.path)
+        files.push({
+          path: x.path,
+          name: safeScriptName(x.path),
+          type: isPy ? "Python" : "JavaScript",
+          url: `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${repo.branch}/${x.path
+            .split("/")
+            .map(encodeURIComponent)
+            .join("/")}`,
+        })
+        if (files.length >= 500) break
+      }
+      files.sort((a, b) => a.path.localeCompare(b.path))
+      return c.json({
+        code: 200,
+        data: {
+          repo: `${repo.owner}/${repo.repo}`,
+          branch: repo.branch,
+          files,
+          total: files.length,
+        },
+      })
+    } catch (e: any) {
+      return c.json({ code: 500, message: e?.message || String(e) }, 500)
+    }
+  })
+
+  /**
+   * 从任意 GitHub 仓库导入勾选的脚本到用户源配置（OmniBox 2.x 风格导入第二步）。
+   */
+  router.post("/spider-library/import", async (c) => {
+    const body = await c.req.json().catch(() => ({}))
+    const repo = parseRepoUrl(String(body.repo || body.url || ""))
+    if (!repo) return c.json({ code: 400, message: "仓库地址无效" }, 400)
+    const prefixName = String(body.prefix || "").trim().slice(0, 40)
+    const proxy = String(body.proxy || "").trim().slice(0, 500)
+    const files: any[] = Array.isArray(body.files) ? body.files.slice(0, 100) : []
+    if (!files.length) return c.json({ code: 400, message: "请至少勾选一个文件" }, 400)
+
+    const cfg = await readConfig(c)
+    const existing = new Map(cfg.spiders.map((s: any) => [s.id, s]))
+    const added: string[] = []
+    const updated: string[] = []
+    const skipped: { path: string; reason: string }[] = []
+
+    for (const f of files) {
+      const path = String(f?.path || "").trim()
+      if (!path || path.includes("..")) {
+        skipped.push({ path, reason: "非法路径" }); continue
+      }
+      const rawUrl = `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${repo.branch}/${path
+        .split("/")
+        .map(encodeURIComponent)
+        .join("/")}`
+      const downloadUrl = applyProxy(rawUrl, proxy)
+      try {
+        const res = await fetch(downloadUrl, {
+          headers: { "User-Agent": "OmniBox-Worker/2.1" },
+          signal: AbortSignal.timeout(20000),
+        })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const code = await res.text()
+        if (!code.trim()) throw new Error("empty script")
+        if (new TextEncoder().encode(code).length > MAX_SCRIPT_BYTES) throw new Error("script too large")
+        const isPy = /\.py$/i.test(path)
+        const id = `gh-${repo.owner}-${repo.repo}-${path.replace(/[^A-Za-z0-9_-]/g, "-")}`.slice(0, 120)
+        const name = (prefixName ? prefixName + " " : "") + safeScriptName(path)
+        const wasExisting = existing.has(id)
+        existing.set(id, {
+          ...(existing.get(id) || {}),
+          id,
+          name,
+          code: isPy
+            ? `# ${name}\n# Python 脚本需要本地 Python 运行时，EdgeOne Serverless 暂不支持执行。\n# 原始地址：${rawUrl}\n`
+            : code,
+          doc: `Imported from ${repo.owner}/${repo.repo}/${path}`,
+          enabled: isPy ? false : wasExisting ? existing.get(id)!.enabled !== false : true,
+          type: isPy ? "Python" : "JavaScript",
+          category: "GitHub 导入",
+          priority: 5,
+          tags: ["GitHub导入"],
+          sourceRepo: `${repo.owner}/${repo.repo}`,
+          path,
+          updatedAt: new Date().toISOString(),
+          nav: existing.get(id)?.nav || false,
+          push: existing.get(id)?.push || false,
+        })
+        if (isPy) skipped.push({ path, reason: "Python 脚本已登记但禁用（Serverless 不支持）" })
+        else if (wasExisting) updated.push(path)
+        else added.push(path)
+      } catch (e: any) {
+        skipped.push({ path, reason: e?.message || String(e) })
+      }
+    }
+
+    cfg.spiders = [...existing.values()].sort(
+      (a: any, b: any) => (Number(b.priority) || 0) - (Number(a.priority) || 0),
+    )
+    await saveConfig(c, cfg)
+    return c.json({
+      code: 200,
+      data: { added, updated, skipped, total: cfg.spiders.length },
+    })
   })
 }
