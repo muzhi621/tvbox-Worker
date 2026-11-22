@@ -1,6 +1,6 @@
 import { Hono } from "hono"
 import { getDb, saveDb } from "../internal/model/db"
-import { getDriver } from "../internal/op/storage"
+import { getDriver, listItems } from "../internal/op/storage"
 import {
   driverConfigs,
   ensureStorageAdditionDeviceId,
@@ -218,6 +218,42 @@ omniboxRouter.post("/mounts/delete", async (c) => {
   }
   await saveDb(db, c.env)
   return c.json({ code: 200, message: "deleted" })
+})
+
+/**
+ * 网盘连通性测试：尝试列一次根目录。
+ * 复用 OpenList 的 listItems（无需用户上下文），成功/失败会自动把
+ * storage.status 更新为 work / 错误信息，前端刷新即可看到最新状态。
+ */
+omniboxRouter.post("/mounts/test", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const id = Number(body.id || 0)
+  const mounts = await readMounts(c)
+  const target =
+    mounts.find((m) => m.id === id) ||
+    (body.path ? mounts.find((m) => m.path === String(body.path)) : undefined)
+  if (!target) return c.json({ code: 404, message: "网盘不存在" }, 404)
+
+  let waitUntil: ((p: Promise<unknown>) => void) | undefined
+  try {
+    if (typeof c.executionCtx?.waitUntil === "function") {
+      waitUntil = (p: Promise<unknown>) => c.executionCtx.waitUntil(p)
+    }
+  } catch {}
+  const ctx = { env: c.env, ...(waitUntil ? { waitUntil } : {}) }
+
+  try {
+    const { content } = await listItems(target.path, ctx)
+    return c.json({
+      code: 200,
+      data: { ok: true, count: Array.isArray(content) ? content.length : 0, path: target.path },
+    })
+  } catch (e: any) {
+    return c.json({
+      code: 200,
+      data: { ok: false, path: target.path, error: String(e?.message || e).slice(0, 300) },
+    })
+  }
 })
 
 // ---------- 媒体库 ----------
