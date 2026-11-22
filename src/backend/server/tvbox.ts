@@ -347,19 +347,21 @@ async function buildConfigFromSelection(
     })
   }
 
-  const hasSpider = spiderIds.length
-    ? cfg.spiders.some((s) => s.enabled && spiderIds.includes(s.id))
-    : cfg.spiders.some((s) => s.enabled)
-  if (hasSpider) {
-    const spiderParams: string[] = []
-    if (code) spiderParams.push(`code=${encodeURIComponent(code)}`)
-    if (spiderIds.length) spiderParams.push(`spiders=${encodeURIComponent(spiderIds.join(","))}`)
-    const spiderApi = abs("/@tvbox/spider")
+  // 每个爬虫源生成独立站点（对齐内网 OmniBox 2.1）：
+  // 源内部的分类由 /@tvbox/spider?spider=<id> 的 home() 返回，
+  // TVBox 点进某个源后再按该源自己的 categoryId 拉取列表。
+  const spiderList = spiderIds.length
+    ? cfg.spiders.filter((s) => s.enabled && spiderIds.includes(s.id))
+    : cfg.spiders.filter((s) => s.enabled)
+  for (const sp of spiderList) {
+    const params: string[] = []
+    if (code) params.push(`code=${encodeURIComponent(code)}`)
+    params.push(`spider=${encodeURIComponent(sp.id)}`)
     sites.push({
-      key: "omnibox_spider",
-      name: "OmniBox 爬虫源",
+      key: `spider_${sp.id}`,
+      name: sp.name || sp.id,
       type: 3,
-      api: spiderParams.length ? `${spiderApi}?${spiderParams.join("&")}` : spiderApi,
+      api: `${abs("/@tvbox/spider")}?${params.join("&")}`,
       searchable: 1,
       filterable: 0,
       changeable: 0,
@@ -378,7 +380,7 @@ async function buildConfigFromSelection(
     })
   }
 
-  return { spider: "", sites, rules: {} }
+  return { spider: "", lives: [], parses: [], sites, rules: {} }
 }
 
 /**
@@ -458,38 +460,75 @@ tvboxRouter.get("/config.json", async (c) => {
   return c.json(config)
 })
 
+/**
+ * 爬虫分类缓存：TVBox 会频繁请求 ac=list 拿分类，每次都跑 home() 太慢。
+ * 缓存 10 分钟；脚本更新/重启后自动失效。
+ */
+const spiderClassCache = new Map<string, { cls: any[]; ts: number }>()
+const SPIDER_CLASS_TTL = 10 * 60 * 1000
+
+function toTvboxClasses(raw: any): any[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((x: any) => ({
+      type_id: String(x?.type_id ?? x?.typeId ?? x?.tid ?? x?.id ?? ""),
+      type_name: String(x?.type_name ?? x?.typeName ?? x?.name ?? ""),
+    }))
+    .filter((x) => x.type_id)
+}
+
+/** 调 home() 取该源自己的分类（带缓存）；返回分类与首页推荐列表。 */
+async function loadSpiderHome(c: any, sp: any): Promise<{ cls: any[]; list: any[] }> {
+  const hit = spiderClassCache.get(sp.id)
+  if (hit && Date.now() - hit.ts < SPIDER_CLASS_TTL) return { cls: hit.cls, list: [] }
+  const res = await runSpider(sp, "home", { page: 1 }, { from: "home", env: c.env })
+  if (!res.ok) return { cls: [], list: [] }
+  const d = res.data || {}
+  const cls = toTvboxClasses(d.class)
+  const list = Array.isArray(d.list) ? d.list : []
+  if (cls.length) spiderClassCache.set(sp.id, { cls, ts: Date.now() })
+  return { cls, list }
+}
+
 tvboxRouter.get("/spider", async (c) => {
   const denied = await accessDenied(c)
   if (denied) return denied
 
   const cfg = await readConfig(c)
-  const selected = c.req.query("spiders")
-  let spiders = cfg.spiders.filter((s) => s.enabled)
-  if (selected) {
-    const ids = new Set(selected.split(",").map((s) => s.trim()).filter(Boolean))
-    spiders = spiders.filter((s) => ids.has(s.id))
+  const emptyBody = { class: [] as any[], list: [] as any[], page: 1, pagecount: 1, limit: 0, total: 0 }
+
+  // 单源模式（每源独立站点）：spider=<id>；兼容旧的聚合 spiders=<ids>
+  const singleId = (c.req.query("spider") || "").trim()
+  let spiders: any[]
+  if (singleId) {
+    const sp = cfg.spiders.find((s: any) => s.id === singleId && s.enabled !== false)
+    if (!sp) return c.json({ code: 404, message: "spider not found", ...emptyBody }, 404)
+    spiders = [sp]
+  } else {
+    const selected = (c.req.query("spiders") || "").trim()
+    spiders = cfg.spiders.filter((s: any) => s.enabled)
+    if (selected) {
+      const set = new Set(selected.split(",").map((x) => x.trim()).filter(Boolean))
+      spiders = spiders.filter((s: any) => set.has(s.id))
+    }
   }
-  const classes = spiders.map((s) => ({ type_id: s.id, type_name: s.name }))
+  if (!spiders.length) return c.json(emptyBody)
 
   const ac = c.req.query("ac") || "videolist"
   const keyword = (c.req.query("wd") || "").trim()
   const ids = c.req.query("ids") || ""
-  const typeId = c.req.query("t") || c.req.query("type") || spiders[0]?.id
+  const typeId = (c.req.query("t") || c.req.query("type") || "").trim()
   const page = pageOf(c)
   const limit = 60
 
-  if (ac === "list") {
-    return c.json({ class: classes, list: [], page: 1, pagecount: 1, limit: 0, total: 0 })
-  }
-
-  try {
-    let rows: any[] = []
-    if (ids.startsWith("spider:")) {
+  // 详情 / 播放
+  if (ids.startsWith("spider:")) {
+    try {
       const parts = ids.split(":")
       const sid = parts[1] || ""
       const playId = b64urlDecode(parts[2] || "")
-      const sp = spiders.find((s) => s.id === sid)
-      if (!sp) return c.json({ code: 404, message: "spider not found", list: [] }, 404)
+      const sp = spiders.find((s: any) => s.id === sid)
+      if (!sp) return c.json({ code: 404, message: "spider not found", ...emptyBody }, 404)
       const detailRes = await runSpider(sp, "detail", { playId, id: playId }, { from: "detail", env: c.env })
       const playRes = await runSpider(sp, "play", { playId }, { from: "play", env: c.env })
       const base = detailRes.data?.list?.[0] || detailRes.data || {}
@@ -498,48 +537,74 @@ tvboxRouter.get("/spider", async (c) => {
       const playText = urls
         .map((u: any) => `${u.name || "线路"}$${u.url || u.play_url || ""}`)
         .join("#")
-      rows.push(
-        fromSpiderVod(
-          {
-            ...base,
-            vod_id: playId,
-            vod_play_from: playData.parse ? "OmniBox解析" : "OmniBox",
-            vod_play_url: playText,
-          },
-          sp.id,
-          sp.name,
-        ),
+      const vod = fromSpiderVod(
+        {
+          ...base,
+          vod_id: playId,
+          vod_play_from: playData.parse ? "OmniBox解析" : "OmniBox",
+          vod_play_url: playText,
+        },
+        sp.id,
+        sp.name,
       )
-    } else {
-      const targets = keyword || ac === "search"
-        ? spiders
-        : spiders.filter((s) => s.id === typeId)
-      for (const sp of targets) {
-        const method = keyword || ac === "search" ? "search" : typeId === sp.id && ac !== "videolist" ? "category" : "home"
-        const params =
-          method === "search"
-            ? { keyword, page }
-            : method === "category"
-              ? { categoryId: c.req.query("categoryId") || c.req.query("pg") || "1", page }
-              : { page }
-        const res = await runSpider(sp, method, params, { from: method, env: c.env })
-        if (!res.ok) {
-          console.warn(`[tvbox] spider ${sp.id}.${method} failed: ${res.error}`)
-          continue
-        }
-        const list = Array.isArray(res.data?.list) ? res.data.list : []
-        for (const v of list) rows.push(fromSpiderVod(v, sp.id, sp.name))
+      return c.json({ class: [], list: [vod], page: 1, pagecount: 1, limit: 1, total: 1 })
+    } catch (e: any) {
+      return c.json({ code: 500, message: safeErrorMessage(e), ...emptyBody }, 500)
+    }
+  }
+
+  // 分类：来自各源 home()（单源时即该源自己的分类）
+  let classes: any[] = []
+  for (const sp of spiders) {
+    const home = await loadSpiderHome(c, sp)
+    classes = classes.concat(home.cls)
+  }
+
+  // 只请求分类列表（TVBox 首屏 ac=list）
+  if (ac === "list" && !keyword && !typeId) {
+    if (spiders.length === 1) {
+      const home = await loadSpiderHome(c, spiders[0])
+      const list = home.list.map((v: any) => fromSpiderVod(v, spiders[0].id, spiders[0].name))
+      return c.json({ class: classes, list: list.slice(0, limit), page: 1, pagecount: 1, limit, total: list.length })
+    }
+    return c.json({ ...emptyBody, class: classes })
+  }
+
+  const rows: any[] = []
+  try {
+    for (const sp of spiders) {
+      let method = "home"
+      let params: any = { page }
+      if (keyword) {
+        method = "search"
+        params = { keyword, page }
+      } else if (typeId && (spiders.length === 1 || typeId !== sp.id)) {
+        // 单源：t= 就是该源的内部 categoryId
+        method = "category"
+        params = { categoryId: typeId, page }
       }
+      const res = await runSpider(sp, method, params, { from: method, env: c.env })
+      if (!res.ok) {
+        console.warn(`[tvbox] spider ${sp.id}.${method} failed: ${res.error}`)
+        continue
+      }
+      const list = Array.isArray(res.data?.list) ? res.data.list : []
+      if (!classes.length) {
+        const extra = toTvboxClasses(res.data?.class)
+        if (extra.length) classes = extra
+      }
+      for (const v of list) rows.push(fromSpiderVod(v, sp.id, sp.name))
     }
 
-    const total = rows.length
+    // 注意：spider 的 category/search 已按 page 分页，不能再二次切片，否则第 2 页为空。
+    const pagecount = rows.length >= limit ? page + 1 : page
     return c.json({
       class: classes,
-      list: rows.slice((page - 1) * limit, page * limit),
+      list: rows,
       page,
-      pagecount: Math.max(1, Math.ceil(total / limit)),
+      pagecount,
       limit,
-      total,
+      total: rows.length,
     })
   } catch (e: any) {
     return c.json({ code: 500, message: safeErrorMessage(e), class: classes, list: [] }, 500)
