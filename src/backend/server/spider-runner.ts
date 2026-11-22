@@ -2,6 +2,7 @@ import vm from "node:vm"
 // 用 slim 入口：只含 HTML 解析与选择器（脚本只需 cheerio.load），
 // 不含 undici / encoding-sniffer，产物更小且不依赖被 external 的 iconv-lite。
 import * as cheerio from "cheerio/slim"
+import { shareInfo, shareList, sharePlay } from "./drive-share"
 
 /**
  * OmniBox JS 爬虫沙箱运行器。
@@ -116,9 +117,12 @@ function sdkShim(ctx: { fetch: typeof fetch; log: (...a: any[]) => void }) {
     getEnv: (key: string) => process.env?.[key] || "",
     scrape: async () => null,
     getDanmu: async () => [],
-    getDriveFileList: async () => [],
-    getDriveVideoPlayInfo: async () => null,
-    getDriveInfoByShareURL: async () => null,
+    // 网盘分享解析（115 / 阿里云盘 / 123，免登录）。网盘类脚本重度依赖这三个方法，
+    // 之前返回 null 会让脚本 TypeError（Cannot read properties of null）。
+    getDriveInfoByShareURL: (u: string) => shareInfo(u),
+    getDriveFileList: (u: string, parentId = "0") => shareList(u, parentId),
+    getDriveVideoPlayInfo: (u: string, fileId: string, routeType = "直连") =>
+      sharePlay(u, fileId, routeType),
     history: async () => [],
     saveHistory: async () => {},
   }

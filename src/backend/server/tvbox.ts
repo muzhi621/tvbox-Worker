@@ -617,7 +617,12 @@ tvboxRouter.get("/spider", async (c) => {
     }
     const data = res.data || {}
     const first = Array.isArray(data.urls) && data.urls[0] ? data.urls[0] : {}
-    const url = String(data.url || first.url || first.play_url || first.playUrl || "")
+    // 网盘脚本返回 data.url 是 [{ name, url }]；其他脚本可能给字符串或 data.urls
+    let url = ""
+    if (Array.isArray(data.url) && data.url[0]) {
+      url = String(data.url[0].url || data.url[0].play_url || data.url[0].playUrl || "")
+    }
+    if (!url) url = String(data.url || first.url || first.play_url || first.playUrl || "")
     if (!url) {
       return c.json({ code: 502, message: data.error || "empty play url", ...emptyBody }, 200)
     }
