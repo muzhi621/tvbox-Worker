@@ -132,6 +132,11 @@ function cacheKey(url: string, parentId: string): string {
 export async function shareInfo(raw: string): Promise<{ driveType: string; displayName: string }> {
   const p = parseShareUrl(raw)
   if (!p) throw new Error(`无法识别的分享链接：${String(raw).slice(0, 120)}`)
+  // 夸克 / UC 虽不能免登录播放，但能匿名列文件，shareInfo 仍要返回给脚本渲染详情；
+  // 其余不支持的网盘（如天翼）直接给明确错误，避免脚本拿到 null 后 TypeError。
+  if (!p.supported && !LIST_ONLY.has(p.driveType)) {
+    throw new Error(`暂不支持${p.displayName}分享解析（当前支持 115 / 阿里云盘 / 123 / 夸克 / UC）`)
+  }
   return { driveType: p.driveType, displayName: p.displayName }
 }
 

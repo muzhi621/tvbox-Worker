@@ -539,20 +539,51 @@ function toTvboxClasses(raw: any): any[] {
     .filter((x) => x.type_id)
 }
 
-/** 调 home() 取该源自己的分类（带缓存）；返回分类、首页列表与失败原因。 */
+/**
+ * 脚本把请求失败写进日志却返回空 list 时，客户端只能看到「这个分类下没有内容」。
+ * 这里从日志尾部识别真实错误，让空结果能带出 code:500 + message。
+ */
+const SPIDER_LOG_ERROR =
+  /\[error\]|\berror\s*:|失败|Exception|fetch failed|Cannot read|is not a constructor|timeout|超时/i
+
+function errorLogs(logs?: string[]): string[] {
+  return (logs || []).filter((x) => SPIDER_LOG_ERROR.test(x)).map((x) => String(x).trim().slice(0, 200))
+}
+
+function spiderErrorOf(data: any, logs?: string[]): string {
+  const direct = String(data?.error || "").trim()
+  if (direct) return direct.slice(0, 300)
+  const found = errorLogs(logs)
+  return found.length ? found.slice(-2).join("；").slice(0, 400) : ""
+}
+
+function runErrorMessage(prefix: string, res: any, fallback = "未知错误"): string {
+  const detail = String(res?.error || "").trim() || spiderErrorOf(null, res?.logs) || fallback
+  return `${prefix}：${detail.slice(0, 400)}`
+}
+
+/** 调 home() 取该源自己的分类（带缓存）；返回分类、首页列表、日志与失败原因。 */
 async function loadSpiderHome(
   c: any,
   sp: any,
-): Promise<{ cls: any[]; list: any[]; error?: string }> {
+): Promise<{ cls: any[]; list: any[]; error?: string; logs?: string[] }> {
   const hit = spiderClassCache.get(sp.id)
-  if (hit && Date.now() - hit.ts < SPIDER_CLASS_TTL) return { cls: hit.cls, list: [] }
+  if (hit && Date.now() - hit.ts < SPIDER_CLASS_TTL) return { cls: hit.cls, list: [], logs: [] }
   const res = await runSpider(sp, "home", { page: 1 }, { from: "tvbox", env: c.env })
-  if (!res.ok) return { cls: [], list: [], error: res.error || "home failed" }
+  if (!res.ok) {
+    return { cls: [], list: [], error: res.error || "home failed", logs: res.logs }
+  }
   const d = res.data || {}
   const cls = toTvboxClasses(d.class)
   const list = Array.isArray(d.list) ? d.list : []
   if (cls.length) spiderClassCache.set(sp.id, { cls, ts: Date.now() })
-  return { cls, list }
+  return {
+    cls,
+    list,
+    // 有内容就不报错误；空结果才把脚本 error 字段 / error 日志当成失败原因
+    error: list.length ? undefined : spiderErrorOf(d, res.logs) || undefined,
+    logs: res.logs,
+  }
 }
 
 tvboxRouter.get("/spider", async (c) => {
@@ -613,7 +644,7 @@ tvboxRouter.get("/spider", async (c) => {
     const flag = (c.req.query("flag") || "").trim()
     const res = await runSpider(sp, "play", { playId, flag, videoId: playId }, { from: "tvbox", env: c.env })
     if (!res.ok) {
-      return c.json({ code: 500, message: `播放失败：${res.error}`, ...emptyBody }, 200)
+      return c.json({ code: 500, message: runErrorMessage("播放失败", res), ...emptyBody }, 200)
     }
     const data = res.data || {}
     const first = Array.isArray(data.urls) && data.urls[0] ? data.urls[0] : {}
@@ -624,7 +655,26 @@ tvboxRouter.get("/spider", async (c) => {
     }
     if (!url) url = String(data.url || first.url || first.play_url || first.playUrl || "")
     if (!url) {
-      return c.json({ code: 502, message: data.error || "empty play url", ...emptyBody }, 200)
+      return c.json(
+        {
+          code: 502,
+          message: String(data.error || "").trim() || runErrorMessage("播放失败", res, "empty play url"),
+          ...emptyBody,
+        },
+        200,
+      )
+    }
+    // 网盘脚本的 link:// 分支依赖客户端本地登录态；服务端拿不到该上下文，
+    // 直接 302 会让播放器拿到无效地址。给出可操作提示而不是静默失败。
+    if (/^(link|driver|omnibox):/i.test(url)) {
+      return c.json(
+        {
+          code: 501,
+          message: "该线路需要客户端网盘登录态，服务端不支持；请换直连线路或 115 / 阿里云盘 / 123 分享源",
+          ...emptyBody,
+        },
+        200,
+      )
     }
     const header = data.header || first.header || {}
     // SUTV 3.0.57+ 带 Accept: application/json —— 回 JSON，header 才能交给播放器
@@ -659,7 +709,7 @@ tvboxRouter.get("/spider", async (c) => {
         { from: "tvbox", env: c.env },
       )
       if (!detailRes.ok) {
-        return c.json({ code: 500, message: `详情失败：${detailRes.error}`, ...emptyBody }, 200)
+        return c.json({ code: 500, message: runErrorMessage("详情失败", detailRes), ...emptyBody }, 200)
       }
       const base = detailRes.data?.list?.[0] || detailRes.data || {}
       const vod = fromSpiderVod({ ...base, vod_id: videoId }, sp.id, sp.name, playHref)
@@ -672,7 +722,13 @@ tvboxRouter.get("/spider", async (c) => {
   // 分类：来自各源 home()（单源时即该源自己的分类），并收集失败原因
   let classes: any[] = []
   const errors: string[] = []
-  const homeResults: { sp: any; cls: any[]; list: any[]; error?: string }[] = []
+  const homeResults: {
+    sp: any
+    cls: any[]
+    list: any[]
+    error?: string
+    logs?: string[]
+  }[] = []
   for (const sp of spiders) {
     const home = await loadSpiderHome(c, sp)
     classes = classes.concat(home.cls)
@@ -730,6 +786,15 @@ tvboxRouter.get("/spider", async (c) => {
         const extra = toTvboxClasses(res.data?.class)
         if (extra.length) classes = extra
       }
+      // 分类/搜索空结果：把脚本 error 字段或 error 级日志带出来，
+      // 否则客户端只会显示「这个分类下没有内容」，无从判断是否爬虫挂了。
+      if (!list.length) {
+        const emptyError = spiderErrorOf(res.data, res.logs)
+        if (emptyError) {
+          errors.push(`${sp.name || sp.id}: ${emptyError}`)
+          console.warn(`[tvbox] spider ${sp.id}.${method} empty: ${emptyError}`)
+        }
+      }
       for (const v of list) rows.push(fromSpiderVod(v, sp.id, sp.name, playHref))
     }
 
@@ -785,6 +850,7 @@ tvboxRouter.get("/debug", async (c) => {
     method,
     ok: r.ok,
     error: r.error || "",
+    logs: r.logs || [],
     ms: Date.now() - started,
     keys: r.data && typeof r.data === "object" ? Object.keys(r.data) : [],
     sample: JSON.stringify(r.data || null).slice(0, 1200),

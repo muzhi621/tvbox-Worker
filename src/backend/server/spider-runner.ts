@@ -129,7 +129,14 @@ function sdkShim(ctx: { fetch: typeof fetch; log: (...a: any[]) => void }) {
   return sdk
 }
 
-export type RunResult = { ok: boolean; data?: any; error?: string; ms: number }
+export type RunResult = {
+  ok: boolean
+  data?: any
+  error?: string
+  ms: number
+  /** 脚本日志尾部；用于把「静默空 list」背后的真实错误透传给客户端 */
+  logs?: string[]
+}
 
 export async function runSpider(
   source: { id: string; name: string; code: string },
@@ -139,27 +146,36 @@ export async function runSpider(
   timeoutMs = DEFAULT_TIMEOUT,
 ): Promise<RunResult> {
   const started = Date.now()
+  const logs: string[] = []
+  const withLogs = <T extends RunResult>(r: T): T => ({ ...r, logs: [...logs] })
   if (Buffer.byteLength(source.code, "utf8") > MAX_CODE_BYTES) {
-    return { ok: false, error: "script too large", ms: 0 }
+    return withLogs({ ok: false, error: "script too large", ms: 0 })
   }
   if (!/^(home|category|detail|search|play)$/.test(method)) {
-    return { ok: false, error: "invalid method", ms: 0 }
+    return withLogs({ ok: false, error: "invalid method", ms: 0 })
   }
 
   // Python 脚本：node:vm 只能跑 JS。明确报错优于抛一个莫名的 SyntaxError。
   if (String((source as any).type || "") === "Python") {
-    return { ok: false, error: "该源是 Python 脚本，当前运行时只支持 JavaScript", ms: 0 }
+    return withLogs({
+      ok: false,
+      error: "该源是 Python 脚本，当前运行时只支持 JavaScript",
+      ms: 0,
+    })
   }
   const head = source.code.slice(0, 2000)
   const looksPython =
     /^\s*(#.*coding[:=].*\n)?\s*(import\s+\w+|from\s+\w+\s+import|def\s+\w+\s*\()/m.test(head) &&
     !/\b(function|const|let|var|module\.exports)\b/.test(head)
   if (looksPython) {
-    return { ok: false, error: "该源是 Python 脚本，当前运行时只支持 JavaScript", ms: 0 }
+    return withLogs({
+      ok: false,
+      error: "该源是 Python 脚本，当前运行时只支持 JavaScript",
+      ms: 0,
+    })
   }
 
   let moduleExport: SpiderModule = {}
-  const logs: string[] = []
   const sdk = sdkShim({
     fetch: (...a) => fetch(...a),
     log: (...a) => {
@@ -227,16 +243,20 @@ export async function runSpider(
       axios.create = (base: any = {}) => {
         const inst: any = (a: any, b: any = {}) => {
           const cfg = typeof a === "string" ? { ...b, url: a } : { ...(a || {}) }
-          if (base.baseURL && cfg.url && !/^https?:/i.test(cfg.url)) {
-            cfg.url = String(base.baseURL).replace(/\/$/, "") + "/" + String(cfg.url).replace(/^\//, "")
+          // 脚本常把 timeout / responseType / validateStatus / maxRedirects 只写在
+          // create() 里，request() 不再重复。只合并 headers 会让实例丢掉这些默认值。
+          const merged: any = { ...base, ...cfg }
+          if (merged.baseURL && merged.url && !/^https?:/i.test(merged.url)) {
+            merged.url =
+              String(merged.baseURL).replace(/\/$/, "") + "/" + String(merged.url).replace(/^\//, "")
           }
-          cfg.headers = { ...(base.headers || {}), ...(cfg.headers || {}) }
-          return send(cfg.url, cfg)
+          merged.headers = { ...(base.headers || {}), ...(cfg.headers || {}) }
+          return send(merged.url, merged)
         }
         inst.get = (u: string, c2: any = {}) => inst({ ...c2, url: u, method: "GET" })
         inst.post = (u: string, d: any, c2: any = {}) => inst({ ...c2, url: u, data: d, method: "POST" })
         inst.request = (c2: any = {}) => inst(c2)
-        inst.defaults = { headers: { common: {} }, ...(base.defaults || {}) }
+        inst.defaults = { headers: { common: {} }, ...(base.defaults || {}), ...base }
         inst.interceptors = { request: { use: () => {} }, response: { use: () => {} } }
         return inst
       }
@@ -260,8 +280,13 @@ export async function runSpider(
       // 假实现算出来的签名是错的，源会返回"参数错误"，比明确报错更难排查
       throw new Error("该源依赖 crypto-js，当前运行时未提供")
     }
-    if (name === "https") return { Agent: class {} }
-    if (name === "http") return {}
+    // 脚本会把 Agent 实例传给 axios 的 httpAgent/httpsAgent；shim 不真的用它建连，
+    // 但必须是构造函数，否则 `new http.Agent()` 直接抛 "is not a constructor"。
+    const DummyAgent = class {
+      constructor(_opts?: any) {}
+    }
+    if (name === "https") return { Agent: DummyAgent }
+    if (name === "http") return { Agent: DummyAgent }
     if (name === "crypto" || name === "node:crypto") return globalThis.crypto
     // 常见安全 Node 内置模块：云函数运行时提供，失败则明确拒绝
     if (/^(path|querystring|url|util|buffer|node:path|node:querystring|node:url|node:util|node:buffer)$/.test(name)) {
@@ -313,11 +338,11 @@ export async function runSpider(
     }
     const fn = moduleExport[method as keyof SpiderModule]
     if (typeof fn !== "function") {
-      return {
+      return withLogs({
         ok: false,
         error: `script does not export ${method}()`,
         ms: Date.now() - started,
-      }
+      })
     }
     // 脚本里 context.from 的语义是「客户端类型」（tvbox/sutv…），不是方法名。
     // 按客户端分支的脚本若收到 from:"home" 会走错路径。
@@ -327,6 +352,9 @@ export async function runSpider(
       sourceId: source.id,
       env: context?.env,
       headers: context?.headers || {},
+      // 云函数没有客户端的网盘登录态：依赖 context.drives 的 link:// 线路不可用，
+      // 显式给空数组，脚本走自己的降级分支，而不是 undefined 引发 TypeError。
+      drives: (context as any)?.drives || [],
     }
     const data = await Promise.race([
       Promise.resolve((fn as any)(params || {}, scriptCtx)),
@@ -334,12 +362,12 @@ export async function runSpider(
         setTimeout(() => reject(new Error("script timeout")), timeoutMs),
       ),
     ])
-    return { ok: true, data: data ?? {}, ms: Date.now() - started }
+    return withLogs({ ok: true, data: data ?? {}, ms: Date.now() - started })
   } catch (e: any) {
-    return {
+    return withLogs({
       ok: false,
       error: String(e?.message || e).slice(0, 500),
       ms: Date.now() - started,
-    }
+    })
   }
 }
