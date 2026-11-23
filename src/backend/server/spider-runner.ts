@@ -18,7 +18,8 @@ import { shareInfo, shareList, sharePlay } from "./drive-share"
  *     runner.run(module.exports) 在 shim 中是空操作，避免抢占 stdin。
  */
 
-const DEFAULT_TIMEOUT = 15000
+// 客户端 receiveTimeout 约 20s；脚本默认 8s，给冷启动与网络留余量。
+const DEFAULT_TIMEOUT = 8000
 const MAX_CODE_BYTES = 512 * 1024
 
 /**
@@ -73,7 +74,20 @@ function sdkShim(ctx: { fetch: typeof fetch; log: (...a: any[]) => void }) {
       if (!url) throw new Error("request: missing url")
 
       const method = String(opts.method || "GET").toUpperCase()
-      const init: RequestInit = { method, headers: opts.headers || {} }
+      // 单个上游请求也要有上限，避免慢站点把整个 /spider 拖过客户端 20s。
+      // 注意不要写成 `(init as any)?.signal` —— 那是在初始化 init 时引用自己，会 TDZ 报错。
+      const incomingSignal = opts.signal
+      const requestSignal: AbortSignal | undefined =
+        incomingSignal && typeof incomingSignal.addEventListener === "function"
+          ? incomingSignal
+          : typeof AbortSignal !== "undefined" && typeof (AbortSignal as any).timeout === "function"
+            ? ((AbortSignal as any).timeout(7000) as AbortSignal)
+            : undefined
+      const init: RequestInit = {
+        method,
+        headers: opts.headers || {},
+        signal: requestSignal,
+      }
       const payload = opts.body ?? opts.data
       if (payload !== undefined && method !== "GET" && method !== "HEAD") {
         init.body = typeof payload === "string" ? payload : JSON.stringify(payload)

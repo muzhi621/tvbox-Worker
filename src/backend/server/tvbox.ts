@@ -523,11 +523,12 @@ tvboxRouter.get("/config.json", async (c) => {
 })
 
 /**
- * 爬虫分类缓存：TVBox 会频繁请求 ac=list 拿分类，每次都跑 home() 太慢。
- * 缓存 10 分钟；脚本更新/重启后自动失效。
+ * 爬虫首页缓存：TVBox 会频繁请求 ac=list 拿分类和推荐，每次都跑 home() 太慢。
+ * cls 与 list 必须一起缓存：只缓存 cls 会让第二次请求拿到空推荐列表。
+ * 缓存 2 分钟；脚本更新/重启后自动失效。
  */
-const spiderClassCache = new Map<string, { cls: any[]; ts: number }>()
-const SPIDER_CLASS_TTL = 10 * 60 * 1000
+const spiderClassCache = new Map<string, { cls: any[]; list: any[]; ts: number }>()
+const SPIDER_CLASS_TTL = 2 * 60 * 1000
 
 function toTvboxClasses(raw: any): any[] {
   if (!Array.isArray(raw)) return []
@@ -568,7 +569,10 @@ async function loadSpiderHome(
   sp: any,
 ): Promise<{ cls: any[]; list: any[]; error?: string; logs?: string[] }> {
   const hit = spiderClassCache.get(sp.id)
-  if (hit && Date.now() - hit.ts < SPIDER_CLASS_TTL) return { cls: hit.cls, list: [], logs: [] }
+  // 命中时必须把 list 一起返回，否则「第一次有推荐、第二次空」会持续整个 TTL。
+  if (hit && Date.now() - hit.ts < SPIDER_CLASS_TTL) {
+    return { cls: hit.cls, list: hit.list, logs: [] }
+  }
   const res = await runSpider(sp, "home", { page: 1 }, { from: "tvbox", env: c.env })
   if (!res.ok) {
     return { cls: [], list: [], error: res.error || "home failed", logs: res.logs }
@@ -576,7 +580,7 @@ async function loadSpiderHome(
   const d = res.data || {}
   const cls = toTvboxClasses(d.class)
   const list = Array.isArray(d.list) ? d.list : []
-  if (cls.length) spiderClassCache.set(sp.id, { cls, ts: Date.now() })
+  if (cls.length || list.length) spiderClassCache.set(sp.id, { cls, list, ts: Date.now() })
   return {
     cls,
     list,
@@ -729,11 +733,14 @@ tvboxRouter.get("/spider", async (c) => {
     error?: string
     logs?: string[]
   }[] = []
-  for (const sp of spiders) {
-    const home = await loadSpiderHome(c, sp)
-    classes = classes.concat(home.cls)
-    homeResults.push({ sp, ...home })
-    if (home.error) errors.push(`${sp.name || sp.id}: ${home.error}`)
+  // 搜索不需要先跑 home()；否则一次搜索会白等一个脚本超时。
+  if (!keyword) {
+    for (const sp of spiders) {
+      const home = await loadSpiderHome(c, sp)
+      classes = classes.concat(home.cls)
+      homeResults.push({ sp, ...home })
+      if (home.error) errors.push(`${sp.name || sp.id}: ${home.error}`)
+    }
   }
 
   // 只请求分类列表（SUTV/TVBox 首屏 ac=list）
@@ -775,13 +782,25 @@ tvboxRouter.get("/spider", async (c) => {
         method = "category"
         params = { categoryId: typeId, page }
       }
-      const res = await runSpider(sp, method, params, { from: "tvbox", env: c.env })
-      if (!res.ok) {
-        console.warn(`[tvbox] spider ${sp.id}.${method} failed: ${res.error}`)
-        errors.push(`${sp.name || sp.id}: ${res.error}`)
-        continue
+      let list: any[] = []
+      let res: any
+      if (method === "home") {
+        // 上面已经为同一个源跑过 home()：再跑一次等于白等一个脚本超时。
+        const home = homeResults.find((h) => h.sp.id === sp.id)
+        // 上面的 home 循环已经把失败原因写进 errors，这里不要重复上报。
+        if (home?.error) continue
+        list = home?.list || []
+        res = { ok: true, data: { list, class: home?.cls }, logs: home?.logs }
+      } else {
+        // timeoutMs 是 runSpider 的第 5 个参数，不是 context 字段。
+        res = await runSpider(sp, method, params, { from: "tvbox", env: c.env }, 8000)
+        if (!res.ok) {
+          console.warn(`[tvbox] spider ${sp.id}.${method} failed: ${res.error}`)
+          errors.push(`${sp.name || sp.id}: ${res.error}`)
+          continue
+        }
+        list = Array.isArray(res.data?.list) ? res.data.list : []
       }
-      const list = Array.isArray(res.data?.list) ? res.data.list : []
       if (!classes.length) {
         const extra = toTvboxClasses(res.data?.class)
         if (extra.length) classes = extra
