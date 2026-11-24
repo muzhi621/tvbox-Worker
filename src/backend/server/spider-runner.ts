@@ -2,6 +2,7 @@ import vm from "node:vm"
 import http from "node:http"
 import https from "node:https"
 import dns from "node:dns/promises"
+import CryptoJS from "crypto-js"
 // 用 slim 入口：只含 HTML 解析与选择器（脚本只需 cheerio.load），
 // 不含 undici / encoding-sniffer，产物更小且不依赖被 external 的 iconv-lite。
 import * as cheerio from "cheerio/slim"
@@ -69,6 +70,40 @@ async function resolveUpstreamIp(host: string): Promise<string> {
 function insecureTls(opts: any): boolean {
   const agent = opts?.httpsAgent || opts?.agent
   return !!(agent && (agent.options?.rejectUnauthorized === false || agent.rejectUnauthorized === false))
+}
+
+/**
+ * 可选的上游代理出口（默认关闭）。
+ *
+ * EdgeOne 免费版的 fetch 出口会拦截部分域名（数字域名、老网盘站），原生回源在
+ * 云函数里也只是 fetch 的兼容层，同样失败。若管理员自建了一个 URL 转发代理
+ * （如 Cloudflare Worker），可通过环境变量 SPIDER_PROXY_URL 指定，格式：
+ *   - 含 {url} 占位符：https://proxy.example.com/fetch?target={url}
+ *   - 否则自动追加 ?url= 参数：https://proxy.example.com/fetch
+ * 目标 URL 会 encodeURIComponent 后拼进去；代理需返回原始响应体。
+ */
+function proxyFetch(
+  template: string,
+  url: string,
+  init: RequestInit,
+  budgetMs: number,
+): Promise<Response> {
+  let target: string
+  if (template.includes("{url}")) {
+    target = template.replace("{url}", encodeURIComponent(url))
+  } else {
+    const u = new URL(template)
+    u.searchParams.set("url", url)
+    target = u.toString()
+  }
+  return fetch(target, {
+    method: init.method,
+    headers: init.headers,
+    signal:
+      typeof AbortSignal !== "undefined" && typeof (AbortSignal as any).timeout === "function"
+        ? ((AbortSignal as any).timeout(Math.max(1000, budgetMs)) as AbortSignal)
+        : init.signal,
+  })
 }
 
 /**
@@ -186,6 +221,8 @@ function sdkShim(
 ) {
   // 进程内缓存，TTL 秒；够跑完一次请求链，不追求跨实例一致
   const cache = new Map<string, { v: string; exp: number }>()
+  // 可选代理出口：优先从绑定 env 读，其次 process.env。默认空 = 关闭。
+  const proxyTemplate = String(env?.SPIDER_PROXY_URL || process.env?.SPIDER_PROXY_URL || "").trim()
   const sdk: any = {
     log: (level: any, ...args: any[]) => {
       const isLevel = typeof level === "string" && /^(info|warn|error|debug)$/i.test(level)
@@ -250,6 +287,28 @@ function sdkShim(
       } catch (e: any) {
         const reason = String(e?.message || e)
         const fallbackStarted = Date.now()
+
+        // 配了代理就优先走代理：比原生回源快，且能绕过 EdgeOne 出口对特定域名的拦截。
+        if (proxyTemplate) {
+          try {
+            const pres = await proxyFetch(proxyTemplate, url, init, budgetMs)
+            const ptext = await pres.text()
+            if (pres.ok && ptext) {
+              ctx.log("[proxy]", `代理成功：status=${pres.status} ${Date.now() - fallbackStarted}ms ${url}`)
+              return {
+                statusCode: pres.status,
+                status: pres.status,
+                headers: Object.fromEntries(pres.headers.entries()),
+                body: ptext,
+                data: ptext,
+              }
+            }
+            ctx.log("[proxy]", `代理返回 ${pres.status}，继续原生回源`)
+          } catch (pe: any) {
+            ctx.log("[proxy]", `代理失败：${String(pe?.message || pe)}，继续原生回源`)
+          }
+        }
+
         ctx.log("[fallback]", `${reason} → 原生回源 ${url}`)
         let raw: RawResponse | null = null
         try {
@@ -471,8 +530,9 @@ export async function runSpider(
       }
     }
     if (name === "crypto-js") {
-      // 假实现算出来的签名是错的，源会返回"参数错误"，比明确报错更难排查
-      throw new Error("该源依赖 crypto-js，当前运行时未提供")
+      // crypto-js 已是项目依赖且会被 esbuild 打包进云函数，直接给脚本用真包。
+      // 之前抛错导致金牌等依赖签名的源直接不可用。
+      return CryptoJS
     }
     // 脚本会把 Agent 实例传给 axios 的 httpAgent/httpsAgent；shim 不真的用它建连，
     // 但必须是构造函数，否则 `new http.Agent()` 直接抛 "is not a constructor"。
