@@ -1,4 +1,7 @@
 import vm from "node:vm"
+import http from "node:http"
+import https from "node:https"
+import dns from "node:dns/promises"
 // 用 slim 入口：只含 HTML 解析与选择器（脚本只需 cheerio.load），
 // 不含 undici / encoding-sniffer，产物更小且不依赖被 external 的 iconv-lite。
 import * as cheerio from "cheerio/slim"
@@ -18,9 +21,134 @@ import { shareInfo, shareList, sharePlay } from "./drive-share"
  *     runner.run(module.exports) 在 shim 中是空操作，避免抢占 stdin。
  */
 
-// 客户端 receiveTimeout 约 20s；脚本默认 8s，给冷启动与网络留余量。
+// 客户端 receiveTimeout 约 20s；脚本默认 8s，网盘源给到 15s。
 const DEFAULT_TIMEOUT = 8000
 const MAX_CODE_BYTES = 512 * 1024
+const DEFAULT_UPSTREAM_TIMEOUT = 10000
+// 单个域名最多 12s；脚本动辄写 30s，但一个源常要试 2 个域名，不能把总预算吃光。
+const MAX_UPSTREAM_TIMEOUT = 12000
+const MAX_UPSTREAM_BYTES = 8 * 1024 * 1024
+
+/**
+ * EdgeOne 的 fetch 对部分站点会直接失败/403（数字域名、Cloudflare 后面的老网盘站）。
+ * 本地验证这些域名用「解析 IP + SNI/Host」的原生 https/http 请求可正常取回页面，
+ * 因此把它作为 fetch 失败后的兜底，而不是改脚本。
+ */
+const FALLBACK_IPS: Record<string, string> = {
+  "123.666291.xyz": "198.44.181.178",
+  "666.666291.xyz": "69.165.66.174",
+  "www.wogg.net": "104.16.151.167",
+  "zmi.kdns.fr": "104.21.8.86",
+}
+const PRIVATE_IP =
+  /^(?:127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.|0\.|::1$|fc00:|fd[0-9a-f]{2}:|fe80:)/i
+
+type RawResponse = {
+  statusCode: number
+  headers: Record<string, string>
+  body: string
+}
+
+function isBlockedIp(ip: string): boolean {
+  return PRIVATE_IP.test(ip) || ip === "localhost"
+}
+
+async function resolveUpstreamIp(host: string): Promise<string> {
+  const fallback = FALLBACK_IPS[host.toLowerCase()]
+  try {
+    const rows = await dns.lookup(host, { all: true })
+    const v4 = rows.find((r) => r.family === 4 && !isBlockedIp(r.address))
+    const any = rows.find((r) => !isBlockedIp(r.address))
+    if (v4) return v4.address
+    if (any) return any.address
+  } catch {}
+  if (fallback && !isBlockedIp(fallback)) return fallback
+  throw new Error(`DNS failed: ${host}`)
+}
+
+function insecureTls(opts: any): boolean {
+  const agent = opts?.httpsAgent || opts?.agent
+  return !!(agent && (agent.options?.rejectUnauthorized === false || agent.rejectUnauthorized === false))
+}
+
+/**
+ * 原生回源：连解析出来的 IP，但保留原域名作为 SNI 和 Host。
+ * forceHttp 用于目标站拒绝 EdgeOne HTTPS 出口的情况（如 wogg）。
+ */
+async function rawRequest(
+  rawUrl: string,
+  opts: any,
+  budgetMs: number,
+  forceHttp = false,
+  depth = 0,
+): Promise<RawResponse> {
+  const u = new URL(rawUrl)
+  const ip = await resolveUpstreamIp(u.hostname)
+  const useHttp = forceHttp || u.protocol === "http:"
+  const mod = useHttp ? http : https
+  const port = u.port ? Number(u.port) : useHttp ? 80 : 443
+  const headers: Record<string, any> = {}
+  for (const [k, v] of Object.entries(opts?.headers || {})) {
+    if (k.toLowerCase() !== "host") headers[k] = v
+  }
+  headers.Host = u.host
+  headers.Connection = "close"
+
+  const payload = opts?.body ?? opts?.data
+  const body =
+    payload === undefined
+      ? undefined
+      : typeof payload === "string"
+        ? payload
+        : JSON.stringify(payload)
+  if (body !== undefined && !Object.keys(headers).some((k) => k.toLowerCase() === "content-length")) {
+    headers["Content-Length"] = Buffer.byteLength(body, "utf8")
+  }
+
+  return new Promise<RawResponse>((resolve, reject) => {
+    const req = mod.request(
+      {
+        hostname: ip,
+        port,
+        method: String(opts?.method || "GET").toUpperCase(),
+        path: `${u.pathname}${u.search}`,
+        headers,
+        servername: useHttp ? undefined : u.hostname,
+        rejectUnauthorized: useHttp ? undefined : !insecureTls(opts),
+      },
+      (res) => {
+        const chunks: Buffer[] = []
+        let size = 0
+        res.on("data", (d: Buffer) => {
+          size += d.length
+          if (size > MAX_UPSTREAM_BYTES) {
+            req.destroy(new Error("upstream response too large"))
+            return
+          }
+          chunks.push(d)
+        })
+        res.on("end", () => {
+          const statusCode = Number(res.statusCode || 0)
+          const loc = res.headers.location
+          if (statusCode >= 300 && statusCode < 400 && loc && depth < 3) {
+            rawRequest(new URL(loc, u).toString(), opts, budgetMs, forceHttp, depth + 1).then(resolve, reject)
+            return
+          }
+          const out: Record<string, string> = {}
+          for (const [k, v] of Object.entries(res.headers)) {
+            if (typeof v === "string") out[k] = v
+            else if (Array.isArray(v)) out[k] = v.join(", ")
+          }
+          resolve({ statusCode, headers: out, body: Buffer.concat(chunks).toString("utf8") })
+        })
+      },
+    )
+    req.on("error", reject)
+    req.setTimeout(Math.max(1000, budgetMs), () => req.destroy(new Error("upstream timeout")))
+    if (body !== undefined) req.write(body)
+    req.end()
+  })
+}
 
 /**
  * 默认库脚本来自公开仓库，不能把部署环境变量整体暴露给沙箱。
@@ -50,7 +178,12 @@ export type SpiderModule = {
   init?: (ctx: any) => Promise<any> | any
 }
 
-function sdkShim(ctx: { fetch: typeof fetch; log: (...a: any[]) => void }) {
+function sdkShim(
+  ctx: { fetch: typeof fetch; log: (...a: any[]) => void },
+  timeoutMs: number,
+  startedAt: number,
+  env: any,
+) {
   // 进程内缓存，TTL 秒；够跑完一次请求链，不追求跨实例一致
   const cache = new Map<string, { v: string; exp: number }>()
   const sdk: any = {
@@ -74,15 +207,27 @@ function sdkShim(ctx: { fetch: typeof fetch; log: (...a: any[]) => void }) {
       if (!url) throw new Error("request: missing url")
 
       const method = String(opts.method || "GET").toUpperCase()
-      // 单个上游请求也要有上限，避免慢站点把整个 /spider 拖过客户端 20s。
+      // 脚本传的 timeout 必须生效，但不允许越过本次 runSpider 的总预算。
+      const remaining = Math.max(1000, timeoutMs - (Date.now() - startedAt))
+      const asked = Number(opts.timeout)
+      const cap =
+        Number.isFinite(asked) && asked > 0
+          ? Math.min(asked, MAX_UPSTREAM_TIMEOUT)
+          : DEFAULT_UPSTREAM_TIMEOUT
+      const budgetMs = Math.min(cap, remaining)
+
       // 注意不要写成 `(init as any)?.signal` —— 那是在初始化 init 时引用自己，会 TDZ 报错。
       const incomingSignal = opts.signal
+      const ownSignal =
+        typeof AbortSignal !== "undefined" && typeof (AbortSignal as any).timeout === "function"
+          ? ((AbortSignal as any).timeout(budgetMs) as AbortSignal)
+          : undefined
       const requestSignal: AbortSignal | undefined =
         incomingSignal && typeof incomingSignal.addEventListener === "function"
-          ? incomingSignal
-          : typeof AbortSignal !== "undefined" && typeof (AbortSignal as any).timeout === "function"
-            ? ((AbortSignal as any).timeout(7000) as AbortSignal)
-            : undefined
+          ? typeof (AbortSignal as any).any === "function" && ownSignal
+            ? (AbortSignal as any).any([incomingSignal, ownSignal])
+            : incomingSignal
+          : ownSignal
       const init: RequestInit = {
         method,
         headers: opts.headers || {},
@@ -93,8 +238,43 @@ function sdkShim(ctx: { fetch: typeof fetch; log: (...a: any[]) => void }) {
         init.body = typeof payload === "string" ? payload : JSON.stringify(payload)
       }
 
-      const res = await ctx.fetch(url, init)
-      const text = await res.text()
+      let res: any
+      let text = ""
+      try {
+        res = await ctx.fetch(url, init)
+        text = await res.text()
+        // EdgeOne 出口 IP 常被老网盘站拒绝；这类状态码走原生回源再试一次。
+        if ((res.status === 403 || res.status === 429) && opts.fallback !== false) {
+          throw new Error(`HTTP ${res.status}`)
+        }
+      } catch (e: any) {
+        const reason = String(e?.message || e)
+        const fallbackStarted = Date.now()
+        ctx.log("[fallback]", `${reason} → 原生回源 ${url}`)
+        let raw: RawResponse | null = null
+        try {
+          raw = await rawRequest(url, opts, budgetMs)
+        } catch (e2: any) {
+          ctx.log("[fallback]", `HTTPS 回源失败：${String(e2?.message || e2)}，改用 HTTP`)
+        }
+        if (!raw || raw.statusCode === 403 || raw.statusCode === 429) {
+          try {
+            const viaHttp = await rawRequest(url, opts, budgetMs, true)
+            if (!raw || viaHttp.statusCode !== 403) raw = viaHttp
+          } catch (e3: any) {
+            ctx.log("[fallback]", `HTTP 回源失败：${String(e3?.message || e3)}`)
+          }
+        }
+        if (!raw) throw new Error(`${reason}；原生回源也失败`)
+        ctx.log("[fallback]", `回源成功：status=${raw.statusCode} ${Date.now() - fallbackStarted}ms`)
+        return {
+          statusCode: raw.statusCode,
+          status: raw.statusCode,
+          headers: raw.headers,
+          body: raw.body,
+          data: raw.body,
+        }
+      }
       return {
         statusCode: res.status,
         status: res.status, // 兼容旧写法
@@ -136,7 +316,7 @@ function sdkShim(ctx: { fetch: typeof fetch; log: (...a: any[]) => void }) {
     getDriveInfoByShareURL: (u: string) => shareInfo(u),
     getDriveFileList: (u: string, parentId = "0") => shareList(u, parentId),
     getDriveVideoPlayInfo: (u: string, fileId: string, routeType = "直连") =>
-      sharePlay(u, fileId, routeType),
+      sharePlay(u, fileId, routeType, env),
     history: async () => [],
     saveHistory: async () => {},
   }
@@ -197,7 +377,7 @@ export async function runSpider(
       logs.push(line.slice(0, 500))
       if (logs.length > 50) logs.shift()
     },
-  })
+  }, timeoutMs, started, context?.env)
 
   const scriptEnv = safeScriptEnv(context?.env)
   const requireShim = (name: string) => {
@@ -324,6 +504,8 @@ export async function runSpider(
       error: (...a: any[]) => sdk.log("[error]", ...a),
     },
     Buffer,
+    // 网盘脚本常用 performance.now() 统计递归列目录耗时；vm 里默认没有这个全局。
+    performance: { now: () => Number(process.hrtime.bigint() / 1000000n) },
     setTimeout,
     clearTimeout,
     TextEncoder,

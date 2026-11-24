@@ -529,6 +529,8 @@ tvboxRouter.get("/config.json", async (c) => {
  */
 const spiderClassCache = new Map<string, { cls: any[]; list: any[]; ts: number }>()
 const SPIDER_CLASS_TTL = 2 * 60 * 1000
+// 网盘源的首页/详情常要跨多个域名或等网盘接口，8s 太紧；单源请求给 18s，仍在客户端 20s 内。
+const SPIDER_TIMEOUT = 18000
 
 function toTvboxClasses(raw: any): any[] {
   if (!Array.isArray(raw)) return []
@@ -573,7 +575,7 @@ async function loadSpiderHome(
   if (hit && Date.now() - hit.ts < SPIDER_CLASS_TTL) {
     return { cls: hit.cls, list: hit.list, logs: [] }
   }
-  const res = await runSpider(sp, "home", { page: 1 }, { from: "tvbox", env: c.env })
+  const res = await runSpider(sp, "home", { page: 1 }, { from: "tvbox", env: c.env }, SPIDER_TIMEOUT)
   if (!res.ok) {
     return { cls: [], list: [], error: res.error || "home failed", logs: res.logs }
   }
@@ -646,7 +648,13 @@ tvboxRouter.get("/spider", async (c) => {
     if (!playId) return c.json({ code: 400, message: "missing id", ...emptyBody }, 400)
     const sp = spiders[0]
     const flag = (c.req.query("flag") || "").trim()
-    const res = await runSpider(sp, "play", { playId, flag, videoId: playId }, { from: "tvbox", env: c.env })
+    const res = await runSpider(
+      sp,
+      "play",
+      { playId, flag, videoId: playId },
+      { from: "tvbox", env: c.env },
+      SPIDER_TIMEOUT,
+    )
     if (!res.ok) {
       return c.json({ code: 500, message: runErrorMessage("播放失败", res), ...emptyBody }, 200)
     }
@@ -711,6 +719,7 @@ tvboxRouter.get("/spider", async (c) => {
         "detail",
         { videoId, playId: videoId, id: videoId },
         { from: "tvbox", env: c.env },
+        SPIDER_TIMEOUT,
       )
       if (!detailRes.ok) {
         return c.json({ code: 500, message: runErrorMessage("详情失败", detailRes), ...emptyBody }, 200)
@@ -747,7 +756,25 @@ tvboxRouter.get("/spider", async (c) => {
   if (ac === "list" && !keyword && !typeId) {
     if (spiders.length === 1) {
       const first = homeResults[0]
-      const list = first.list.map((v: any) => fromSpiderVod(v, first.sp.id, first.sp.name, playHref))
+      let list = first.list.map((v: any) => fromSpiderVod(v, first.sp.id, first.sp.name, playHref))
+      // 很多网盘源 home() 只返回分类、不返回推荐；直接取第一个分类填首页，避免「页面没数据」。
+      if (!list.length && first.cls.length) {
+        const categoryId = String(first.cls[0]?.type_id || "").trim()
+        if (categoryId) {
+          const fb = await runSpider(
+            first.sp,
+            "category",
+            { categoryId, page },
+            { from: "tvbox", env: c.env },
+            SPIDER_TIMEOUT,
+          )
+          if (fb.ok) {
+            const raw = Array.isArray(fb.data?.list) ? fb.data.list : []
+            list = raw.map((v: any) => fromSpiderVod(v, first.sp.id, first.sp.name, playHref))
+            if (list.length) spiderClassCache.set(first.sp.id, { cls: first.cls, list: raw, ts: Date.now() })
+          }
+        }
+      }
       if (!list.length && first.error) {
         // 业务错误写进 body（HTTP 保持 200，避免标准 TVBox 报「网络错误」）
         return c.json(
@@ -793,7 +820,7 @@ tvboxRouter.get("/spider", async (c) => {
         res = { ok: true, data: { list, class: home?.cls }, logs: home?.logs }
       } else {
         // timeoutMs 是 runSpider 的第 5 个参数，不是 context 字段。
-        res = await runSpider(sp, method, params, { from: "tvbox", env: c.env }, 8000)
+        res = await runSpider(sp, method, params, { from: "tvbox", env: c.env }, SPIDER_TIMEOUT)
         if (!res.ok) {
           console.warn(`[tvbox] spider ${sp.id}.${method} failed: ${res.error}`)
           errors.push(`${sp.name || sp.id}: ${res.error}`)
@@ -861,7 +888,13 @@ tvboxRouter.get("/debug", async (c) => {
   const sp = cfg.spiders.find((s: any) => s.id === id)
   if (!sp) return c.json({ code: 404, message: "spider not found" }, 404)
   const started = Date.now()
-  const r = await runSpider(sp, method, { page: 1, categoryId: c.req.query("t") || "", keyword: c.req.query("wd") || "" }, { from: "tvbox", env: c.env })
+  const r = await runSpider(
+    sp,
+    method,
+    { page: 1, categoryId: c.req.query("t") || "", keyword: c.req.query("wd") || "" },
+    { from: "tvbox", env: c.env },
+    SPIDER_TIMEOUT,
+  )
   return c.json({
     code: 200,
     spider: sp.id,

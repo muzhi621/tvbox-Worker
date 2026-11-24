@@ -1,6 +1,8 @@
 import { Pan115ShareApiClient } from "../drivers/115_share/util"
 import { AliyundriveShareApiClient } from "../drivers/aliyundrive_share/util"
 import { Pan123ShareApiClient } from "../drivers/123_share/util"
+import { QuarkClient } from "../drivers/quark/util"
+import { getDb } from "../internal/model/db"
 import type { Pan123ShareFileInfo } from "../drivers/123_share/types"
 
 /**
@@ -23,8 +25,14 @@ export type ShareInfo = {
 export type ShareFile = {
   fid: string
   name: string
+  /** 木偶等脚本用 file_name 判视频后缀，必须和 name 同时给 */
+  file_name: string
   size: number
   isDir: boolean
+  /** 木偶等 OmniBox 脚本按 dir/file 判断，不能只给 isDir */
+  dir: boolean
+  file: boolean
+  format_type?: string
   raw: any
 }
 
@@ -34,6 +42,27 @@ const BROWSER_UA =
 const SUPPORTED = new Set(["115", "aliyundrive", "123"])
 /** 能匿名列文件（详情可出集数），但播放需转存/登录的网盘 */
 const LIST_ONLY = new Set(["quark", "uc"])
+
+function shareFile(
+  fid: string,
+  name: string,
+  size: number,
+  isDir: boolean,
+  raw: any,
+  formatType?: string,
+): ShareFile {
+  return {
+    fid,
+    name,
+    file_name: name,
+    size,
+    isDir,
+    dir: isDir,
+    file: !isDir,
+    format_type: formatType,
+    raw,
+  }
+}
 
 /** 从分享链接识别网盘并解析出 share 参数。 */
 export function parseShareUrl(raw: string): ShareInfo | null {
@@ -128,6 +157,115 @@ function cacheKey(url: string, parentId: string): string {
   return `${url}::${parentId || "0"}`
 }
 
+/** 从已挂载网盘里找夸克/UC 的登录 cookie（只服务端使用，绝不下发前端）。 */
+async function findQuarkMount(env: any, type: "quark" | "uc"): Promise<any | null> {
+  try {
+    const db = await getDb(env)
+    for (const s of db.storages || []) {
+      if (!s || s.disabled || !s.mount_path) continue
+      const driver = String(s.driver || "").toLowerCase()
+      const match = type === "uc" ? driver.includes("uc") && !driver.includes("quark") : driver.includes("quark")
+      if (!match) continue
+      let addition: any = s.addition
+      if (typeof addition === "string") {
+        try {
+          addition = JSON.parse(addition)
+        } catch {
+          continue
+        }
+      }
+      if (addition && String(addition.cookie || "").trim()) return { addition, driver }
+    }
+  } catch {}
+  return null
+}
+
+/** 从列表缓存/递归列表里找到分享文件的原始对象（需要 share_fid_token 才能转存）。 */
+async function findShareFile(raw: string, fid: string, depth = 0): Promise<any | null> {
+  const id = String(fid || "")
+  for (const [k, v] of listCache) {
+    if (!k.startsWith(`${raw}::`)) continue
+    const hit = v.files.find((f) => f.fid === id)
+    if (hit) return hit.raw
+  }
+  if (depth > 3) return null
+  const { files } = await shareList(raw, "0")
+  for (const f of files) {
+    if (f.fid === id) return f.raw
+    if (f.dir) {
+      const nested = await findShareFile(raw, id, depth + 1)
+      if (nested) return nested
+    }
+  }
+  return null
+}
+
+/** 把分享文件转存到已登录的夸克/UC 账号，再取自己的下载直链。 */
+async function quarkSaveAndDownload(
+  raw: string,
+  p: ShareInfo,
+  fileId: string,
+  env: any,
+): Promise<{ url: string; headers: Record<string, string>; name: string }> {
+  const type: "quark" | "uc" = p.driveType === "uc" ? "uc" : "quark"
+  const mount = await findQuarkMount(env, type)
+  if (!mount) {
+    throw new Error(`${p.displayName}播放需要先转存：请在后台挂载并登录${p.displayName}（填写 cookie）`)
+  }
+  const host = type === "uc" ? "pc-api.uc.cn" : "drive-pc.quark.cn"
+  const pr = type === "uc" ? "UCBrowser" : "ucpro"
+  const referer = type === "uc" ? "https://drive.uc.cn/" : "https://pan.quark.cn/"
+  const cookie = String(mount.addition.cookie || "")
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Cookie: cookie,
+    Referer: referer,
+    "User-Agent": BROWSER_UA,
+  }
+  const stoken = await quarkShareToken(host, pr, p.shareId, p.password)
+  const file = await findShareFile(raw, fileId)
+  const saveRes = await fetch(`https://${host}/1/clouddrive/share/sharepage/save?pr=${pr}&fr=pc`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      fid_list: [String(fileId)],
+      fid_token_list: file?.share_fid_token ? [String(file.share_fid_token)] : [],
+      pwd_id: p.shareId,
+      stoken,
+      to_pdir_fid: "0",
+      pdir_fid: "0",
+      pdir_save_all: false,
+      scene: "link",
+    }),
+    signal: AbortSignal.timeout(15000),
+  })
+  const saved: any = await saveRes.json().catch(() => ({}))
+  const taskId = saved?.data?.task_id
+  if (!taskId) throw new Error(`${p.displayName}转存失败：${saved?.message || "未返回任务 ID"}`)
+
+  let savedFid = ""
+  for (let i = 0; i < 20; i++) {
+    const taskRes = await fetch(
+      `https://${host}/1/clouddrive/task?pr=${pr}&fr=pc&task_id=${encodeURIComponent(String(taskId))}`,
+      { headers, signal: AbortSignal.timeout(8000) },
+    )
+    const task: any = await taskRes.json().catch(() => ({}))
+    if (Number(task?.status) === 2) {
+      savedFid = String(task?.data?.save_as_top_fids?.[0] || "")
+      break
+    }
+    await new Promise((r) => setTimeout(r, 400))
+  }
+  if (!savedFid) throw new Error(`${p.displayName}转存未完成，请稍后重试`)
+
+  const client = new QuarkClient({
+    cookie,
+    variant: type === "uc" ? "UC" : "Quark",
+  } as any)
+  const got = await client.getDownloadUrl(savedFid, String(file?.file_name || fileId))
+  return { url: got.url, headers: got.headers, name: type === "uc" ? "UC网盘" : "夸克网盘" }
+}
+
 /** 对应脚本的 OmniBox.getDriveInfoByShareURL(shareURL) */
 export async function shareInfo(raw: string): Promise<{ driveType: string; displayName: string }> {
   const p = parseShareUrl(raw)
@@ -167,13 +305,13 @@ export async function shareList(
     const items = await client.getFiles(parentId && parentId !== "0" ? parentId : "0")
     files = items.map((f) => {
       const isDir = f.is_file === 0
-      return {
-        fid: String(isDir ? f.category_id || "" : f.file_id || ""),
-        name: String(f.file_name || "file"),
-        size: Number(f.file_size || 0) || 0,
+      return shareFile(
+        String(isDir ? f.category_id || "" : f.file_id || ""),
+        String(f.file_name || "file"),
+        Number(f.file_size || 0) || 0,
         isDir,
-        raw: f,
-      }
+        f,
+      )
     })
   } else if (p.driveType === "aliyundrive") {
     const client = new AliyundriveShareApiClient({
@@ -182,38 +320,36 @@ export async function shareList(
     } as any)
     await client.init()
     const items = await client.getFiles(parentId && parentId !== "0" ? parentId : "root")
-    files = items.map((f) => ({
-      fid: String(f.file_id || ""),
-      name: String(f.name || "file"),
-      size: Number(f.size || 0) || 0,
-      isDir: f.type === "folder",
-      raw: f,
-    }))
+    files = items.map((f) => {
+      const isDir = f.type === "folder"
+      return shareFile(String(f.file_id || ""), String(f.name || "file"), Number(f.size || 0) || 0, isDir, f)
+    })
   } else if (p.driveType === "123") {
     const client = new Pan123ShareApiClient({
       sharekey: p.shareId,
       sharepassword: p.password,
     } as any)
     const items = await client.getFiles(parentId && parentId !== "0" ? parentId : "0")
-    files = items.map((f) => ({
-      fid: String(f.FileId),
-      name: String(f.FileName || "file"),
-      size: Number(f.Size || 0) || 0,
-      isDir: f.Type === 1,
-      raw: f,
-    }))
+    files = items.map((f) => {
+      const isDir = f.Type === 1
+      return shareFile(String(f.FileId), String(f.FileName || "file"), Number(f.Size || 0) || 0, isDir, f)
+    })
   } else if (p.driveType === "quark" || p.driveType === "uc") {
     const host = p.driveType === "uc" ? "pc-api.uc.cn" : "drive-pc.quark.cn"
     const pr = p.driveType === "uc" ? "UCBrowser" : "ucpro"
     const stoken = await quarkShareToken(host, pr, p.shareId, p.password)
     const items = await quarkShareDetail(host, pr, p.shareId, stoken, parentId)
-    files = items.map((f: any) => ({
-      fid: String(f.fid || ""),
-      name: String(f.file_name || f.name || "file"),
-      size: Number(f.size || 0) || 0,
-      isDir: f.dir === true || f.file_type === 0,
-      raw: f,
-    }))
+    files = items.map((f: any) => {
+      const isDir = f.dir === true || f.file_type === 0
+      return shareFile(
+        String(f.fid || ""),
+        String(f.file_name || f.name || "file"),
+        Number(f.size || 0) || 0,
+        isDir,
+        f,
+        f.format_type ? String(f.format_type) : undefined,
+      )
+    })
   }
 
   listCache.set(key, { files, ts: Date.now() })
@@ -226,11 +362,13 @@ export async function sharePlay(
   raw: string,
   fileId: string,
   _routeType = "直连",
+  env?: any,
 ): Promise<{ url: { name: string; url: string }[]; header: Record<string, string> }> {
   const p = parseShareUrl(raw)
   if (!p) throw new Error(`无法识别的分享链接：${String(raw).slice(0, 120)}`)
   if (LIST_ONLY.has(p.driveType)) {
-    throw new Error(`${p.displayName}分享播放需先转存到自己的网盘（暂未开放），可直接播放：115 / 阿里云盘 / 123`)
+    const got = await quarkSaveAndDownload(raw, p, fileId, env)
+    return { url: [{ name: got.name, url: got.url }], header: got.headers }
   }
   if (!p.supported) {
     throw new Error(`暂不支持${p.displayName}分享播放（当前支持 115 / 阿里云盘 / 123）`)
