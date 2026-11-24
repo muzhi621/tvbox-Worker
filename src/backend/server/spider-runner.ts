@@ -106,6 +106,64 @@ function proxyFetch(
   })
 }
 
+/** 后台设置的缓存，避免每次跑脚本都读一次 KV。 */
+let proxySettingCache: { url: string; exp: number } | null = null
+
+/**
+ * 代理地址优先级：环境变量绑定 > process.env > 后台设置（db.settings.spider_proxy_url）。
+ * 后台保存后最多 30 秒内生效，不需要重启 Worker。
+ */
+async function resolveProxyUrl(env: any): Promise<string> {
+  const direct = String(env?.SPIDER_PROXY_URL || process.env?.SPIDER_PROXY_URL || "").trim()
+  if (direct) return direct
+  if (proxySettingCache && proxySettingCache.exp > Date.now()) return proxySettingCache.url
+  let url = ""
+  try {
+    const { getSettingsMap } = await import("../internal/media/store")
+    const map = await getSettingsMap(env)
+    url = String(map?.spider_proxy_url || "").trim()
+  } catch {}
+  proxySettingCache = { url, exp: Date.now() + 30_000 }
+  return url
+}
+
+/** 管理页「测试代理」用：真实走一次代理链路，返回可用性诊断。 */
+export async function probeProxy(template: string, timeoutMs = 8000): Promise<{
+  ok: boolean
+  status: number
+  ms: number
+  sample: string
+  error?: string
+}> {
+  const started = Date.now()
+  const clean = String(template || "").trim()
+  if (!clean) return { ok: false, status: 0, ms: 0, sample: "", error: "代理地址不能为空" }
+  try {
+    const res = await proxyFetch(
+      clean,
+      "https://example.com/",
+      { method: "GET", headers: { "User-Agent": "OmniBox-Proxy-Probe/1.0" } },
+      Math.max(1000, timeoutMs),
+    )
+    const text = await res.text()
+    return {
+      ok: res.ok && text.length > 0,
+      status: res.status,
+      ms: Date.now() - started,
+      sample: text.replace(/\s+/g, " ").slice(0, 120),
+      error: res.ok ? undefined : `HTTP ${res.status}`,
+    }
+  } catch (e: any) {
+    return {
+      ok: false,
+      status: 0,
+      ms: Date.now() - started,
+      sample: "",
+      error: String(e?.message || e),
+    }
+  }
+}
+
 /**
  * 原生回源：连解析出来的 IP，但保留原域名作为 SNI 和 Host。
  * forceHttp 用于目标站拒绝 EdgeOne HTTPS 出口的情况（如 wogg）。
@@ -218,11 +276,10 @@ function sdkShim(
   timeoutMs: number,
   startedAt: number,
   env: any,
+  proxyTemplate = "",
 ) {
   // 进程内缓存，TTL 秒；够跑完一次请求链，不追求跨实例一致
   const cache = new Map<string, { v: string; exp: number }>()
-  // 可选代理出口：优先从绑定 env 读，其次 process.env。默认空 = 关闭。
-  const proxyTemplate = String(env?.SPIDER_PROXY_URL || process.env?.SPIDER_PROXY_URL || "").trim()
   const sdk: any = {
     log: (level: any, ...args: any[]) => {
       const isLevel = typeof level === "string" && /^(info|warn|error|debug)$/i.test(level)
@@ -429,6 +486,7 @@ export async function runSpider(
   }
 
   let moduleExport: SpiderModule = {}
+  const proxyTemplate = await resolveProxyUrl(context?.env)
   const sdk = sdkShim({
     fetch: (...a) => fetch(...a),
     log: (...a) => {
@@ -436,7 +494,7 @@ export async function runSpider(
       logs.push(line.slice(0, 500))
       if (logs.length > 50) logs.shift()
     },
-  }, timeoutMs, started, context?.env)
+  }, timeoutMs, started, context?.env, proxyTemplate)
 
   const scriptEnv = safeScriptEnv(context?.env)
   const requireShim = (name: string) => {

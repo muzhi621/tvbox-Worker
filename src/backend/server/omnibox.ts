@@ -14,7 +14,7 @@ import {
 import { scrapeMedia } from "../internal/media/scrape"
 import { scanMedia, getScanProgress, isScanRunning } from "../internal/media/scan"
 import { readMounts } from "./tvbox-admin"
-import { runSpider } from "./spider-runner"
+import { runSpider, probeProxy } from "./spider-runner"
 import { registerSpiderLibraryRoutes } from "./spider-library"
 import { registerOmniBoxDataRoutes, readAppSection, writeAppSection } from "./omnibox-extra"
 import {
@@ -375,6 +375,50 @@ omniboxRouter.post("/media/tmdb-key", async (c) => {
   const { saveDb } = await import("../internal/model/db")
   await saveDb(db, c.env)
   return c.json({ code: 200, message: key ? "TMDB key saved" : "TMDB key cleared" })
+})
+
+// ---------- 出口代理（木偶等被 EdgeOne 出口封锁的网盘源） ----------
+
+const SPIDER_PROXY_KEY = "spider_proxy_url"
+
+omniboxRouter.get("/spider/proxy", async (c) => {
+  let dbValue = ""
+  try {
+    const db = await getDb(c.env)
+    dbValue = String((db.settings || []).find((s: any) => s?.key === SPIDER_PROXY_KEY)?.value || "")
+  } catch {}
+  const envUrl = String((c.env as any)?.SPIDER_PROXY_URL || process.env?.SPIDER_PROXY_URL || "")
+  return c.json({
+    code: 200,
+    data: { url: dbValue, envUrl, source: envUrl ? "env" : dbValue ? "db" : "" },
+  })
+})
+
+omniboxRouter.post("/spider/proxy", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const url = String(body.url || "").trim().slice(0, 1000)
+  if (url && !/^https?:\/\//i.test(url)) {
+    return c.json({ code: 400, message: "代理地址必须以 http(s):// 开头" }, 400)
+  }
+  const db = await getDb(c.env)
+  if (!Array.isArray(db.settings)) db.settings = []
+  const row = db.settings.find((s: any) => s?.key === SPIDER_PROXY_KEY)
+  if (row) row.value = url
+  else db.settings.push({
+    key: SPIDER_PROXY_KEY, value: url, type: "string",
+    help: "OmniBox spider upstream proxy", group: 99, flag: 0,
+  })
+  await saveDb(db, c.env)
+  return c.json({ code: 200, message: url ? "代理地址已保存" : "代理地址已清空" })
+})
+
+omniboxRouter.post("/spider/proxy/test", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const template =
+    String(body.url || "").trim() ||
+    String((c.env as any)?.SPIDER_PROXY_URL || process.env?.SPIDER_PROXY_URL || "")
+  const result = await probeProxy(template, 8000)
+  return c.json({ code: 200, data: result })
 })
 
 // ---------- 源管理 ----------

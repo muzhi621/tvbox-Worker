@@ -158,7 +158,7 @@ export function registerOmniBoxDataRoutes(router: Hono) {
       source,
       "home",
       { ...(body.params || {}), taskName: task.name },
-      { from: "task" },
+      { from: "task", env: c.env },
       Math.min(120000, Math.max(1000, Number(task.timeout) || 300) * 1000),
     )
     return c.json(

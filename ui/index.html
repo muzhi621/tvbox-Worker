@@ -243,6 +243,13 @@ tr:hover td{background:#fbfdff}
     <div class="field"><label>TMDB 访问令牌</label><input id="tmdbKey" type="password" placeholder="输入您的 TMDB 访问令牌"></div>
     <button class="btn" id="saveTmdb">保存</button>
   </div>
+  <div class="card"><h3>上游代理出口（木偶 / 玩偶等网盘源）</h3>
+    <p class="muted">EdgeOne 免费版会拦截部分老网盘站域名，订阅里这些源会显示「页面无数据」。部署一个 Cloudflare Worker 转发代理并把地址填这里，爬虫请求会自动走代理。留空 = 使用环境变量或关闭代理。</p>
+    <div class="field"><label>代理地址</label><input id="spiderProxyUrl" placeholder="https://proxy.example.com/fetch?url={url}"></div>
+    <div class="muted" id="proxySource" style="margin:6px 0 10px"></div>
+    <div class="row" style="gap:8px"><button class="btn" id="saveProxy">保存</button><button class="btn-green-soft" id="testProxy">测试连通</button><button class="btn-light" id="clearProxy">清空</button></div>
+    <p class="muted" style="margin-top:10px">格式：用 <code>{url}</code> 作为目标地址占位符；若未写占位符则自动追加 <code>?url=</code> 参数。代理必须原样返回目标站响应体。仓库 <code>proxy/cloudflare-worker.js</code> 可直接部署。</p>
+  </div>
 </section>
 
   </div>
@@ -326,9 +333,13 @@ $('#mediaSearch').onclick=loadMedia;$('#mediaKey').addEventListener('keydown',fu
 $('#mediaScan').onclick=function(){if(!$('#scanPath').value)return toast('请先添加扫描路径','err');api('/media/scan',{method:'POST',body:{media_type:$('#mediaType').value,scan_path_id:Number($('#scanPath').value||0)}}).then(function(){toast('扫描已启动，稍后刷新','ok')}).catch(function(e){toast(e.message,'err')})};
 $('#addScanPath').onclick=function(){var p=$('#newScanPath').value.trim();if(!p.startsWith('/')||p.includes('..'))return toast('请输入以 / 开头的有效路径','err');api('/media/scan-paths',{method:'POST',body:{path:p,media_type:$('#mediaType').value}}).then(function(){toast('扫描路径已添加','ok');$('#newScanPath').value='';loadMedia()}).catch(function(e){toast(e.message,'err')})};
 $('#mediaScrape').onclick=function(){api('/media/scrape',{method:'POST',body:{media_type:$('#mediaType').value}}).then(function(){toast('刮削已启动','ok')}).catch(function(e){toast(e.message,'err')})};
-function loadPlugins(){api('/app-data').then(function(j){appData=j.data;var p=appData.plugins||{};$('#danmakuApi').value=p.danmakuApi||'';$('#tmdbKey').value=p.tmdbKey||''}).catch(function(e){toast(e.message,'err')})}
+function loadPlugins(){Promise.all([api('/app-data'),api('/spider/proxy')]).then(function(r){appData=r[0].data||appData;var p=appData.plugins||{};$('#danmakuApi').value=p.danmakuApi||'';$('#tmdbKey').value=p.tmdbKey||'';var pr=r[1].data||{};$('#spiderProxyUrl').value=pr.url||'';$('#proxySource').textContent=pr.envUrl?('当前由环境变量生效：'+pr.envUrl.slice(0,70)+(pr.envUrl.length>70?'…':'')):(pr.url?'当前由后台设置生效（最多 30 秒后应用）':'未配置代理，木偶等被封锁域名将无数据')}).catch(function(e){toast(e.message,'err')})}
 $('#saveDanmaku').onclick=function(){var p=appData.plugins||{};p.danmakuApi=$('#danmakuApi').value.trim();saveSection('plugins',p).then(function(){toast('弹幕 API 已保存','ok')})};
 $('#saveTmdb').onclick=function(){var p=appData.plugins||{};p.tmdbKey=$('#tmdbKey').value.trim();saveSection('plugins',p).then(function(){toast('TMDB Key 已保存','ok')})};
+function saveProxy(u){api('/spider/proxy',{method:'POST',body:{url:u}}).then(function(){toast(u?'代理地址已保存，最多 30 秒后生效':'代理地址已清空','ok');loadPlugins()}).catch(function(e){toast(e.message,'err')})}
+$('#saveProxy').onclick=function(){saveProxy($('#spiderProxyUrl').value.trim())};
+$('#clearProxy').onclick=function(){$('#spiderProxyUrl').value='';saveProxy('')};
+$('#testProxy').onclick=function(){var v=$('#spiderProxyUrl').value.trim();if(!v)return toast('请先填写代理地址','err');var b=this,old=b.textContent;b.disabled=true;b.textContent='测试中…';api('/spider/proxy/test',{method:'POST',body:{url:v}}).then(function(j){var d=j.data||{};toast(d.ok?('代理正常：HTTP '+d.status+' · '+d.ms+'ms'):('代理失败：'+(d.error||('HTTP '+d.status))),d.ok?'ok':'err')}).catch(function(e){toast(e.message,'err')}).then(function(){b.disabled=false;b.textContent=old})};
 
 if(!code){$('#loginMask').classList.add('on')}else{loadAll()}
 </script>
